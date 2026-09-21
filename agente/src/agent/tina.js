@@ -12,6 +12,7 @@ import { generateTinaReplyOpenAI } from './tina-openai.js';
 import { generateTinaReplyAnthropic } from './tina-anthropic.js';
 import { generateTinaReplyGemini } from './tina-gemini.js';
 import { applyPolicyGuard } from './policyGuard.js';
+import { expediente } from './scheduling.js';
 import { logger } from '../utils/logger.js';
 
 let warnedProvider = false;
@@ -149,7 +150,17 @@ export async function generateTinaReply({ contact, incomingText, extraContext = 
       weekday: 'long', day: '2-digit', month: '2-digit', year: 'numeric',
       hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
     }).format(new Date());
-    const horaCtx = `AGORA em Brasília: ${agora}. Horário de atendimento do time humano: 9h às 18h, seg-sex.`;
+    // Status do expediente calculado pelo CÓDIGO (antes a Tina tinha que deduzir
+    // pelo relógio, e no fim de semana seguia oferecendo "falar agora").
+    const exp = expediente();
+    const expCtx = exp.aberto
+      ? `O time humano está ATENDENDO agora (${exp.faixa}, seg-sex).`
+      : `🌙 FORA DO EXPEDIENTE AGORA — o time humano atende ${exp.faixa}, seg-sex; o próximo atendimento é ${exp.proxima}. `
+        + `A qualificação e a nota seguem EXATAMENTE iguais — isto só muda o PASSO FINAL. `
+        + `NÃO ofereça "falar agora" (não há ninguém pra atender): quando o lead qualificar, vá DIRETO pro agendamento `
+        + `(handoff_mode "agendar") e ofereça horários. Só se o próprio lead PEDIR pra falar com alguém, use handoff_mode "agora" `
+        + `e avise com clareza que o time retoma ${exp.proxima} — NUNCA escreva "agora mesmo", "já estou te conectando" nem "em instantes".`;
+    const horaCtx = `AGORA em Brasília: ${agora}. ${expCtx}`;
     extraContext = extraContext ? `${horaCtx}\n\n${extraContext}` : horaCtx;
   } catch { /* sem hora no contexto, segue */ }
 

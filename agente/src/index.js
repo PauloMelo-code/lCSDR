@@ -14,6 +14,7 @@ import { startScheduler } from './scheduler.js';
 import { captureRawBody } from './ghl/webhookSig.js';
 import { refreshCustomFieldsCache } from './ghl/customFields.js';
 import { preferredChannel } from './agent/messenger.js';
+import { expediente, expedienteConfig } from './agent/scheduling.js';
 
 // Importar db só pra rodar schema antes de servir
 import { db } from './db/index.js';
@@ -112,6 +113,9 @@ app.get('/health', (_, res) => {
         // momento da conversa" (invariante #3). Serve também de marcador de build:
         // se este campo aparece, o deploy pegou as correções de 04/09.
         historyGapDays: Number(process.env.LLM_HISTORY_GAP_DAYS ?? 2),
+        // Expediente do time humano (0=dom … 6=sáb) e se está aberto AGORA — define
+        // se a Tina oferece "falar agora" e qual aviso vai pro grupo.
+        expediente: (() => { const e = expediente(); return { ...expedienteConfig(), abertoAgora: e.aberto, proxima: e.proxima }; })(),
         // tags de origem que a Tina NÃO atende (nomes, não são segredo) — permite
         // conferir em produção se o bloqueio (ex.: form de Arquitetos) está ativo.
         blockTags: (process.env.GHL_TAG_BLOCK || '').split(',').map(s => s.trim()).filter(Boolean),

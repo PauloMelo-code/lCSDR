@@ -62,6 +62,51 @@ function withinBusinessHours(iso) {
   return h >= SCHED_HOUR_MIN && h < SCHED_HOUR_MAX;
 }
 
+// EXPEDIENTE DO TIME HUMANO (quando alguém pode de fato atender o lead).
+// ⚠️ Diferente da trava SCHEDULING_HOUR_MIN/MAX acima: aquela é o envelope dos
+// horários de REUNIÃO; esta é quando há gente pra responder AGORA.
+// Antes o expediente só existia como frase no prompt — o código não sabia se era
+// fim de semana. ❌ CASO REAL (19-20/09): no sábado e domingo a Tina ofereceu
+// "falar agora" em 20 conversas, e o grupo recebeu "🔥 Lead quer falar AGORA —
+// assumir o quanto antes" pra lead a quem ela tinha acabado de dizer "te chamamos
+// na segunda". Config: ATENDIMENTO_DIAS (0=dom … 6=sáb), ATENDIMENTO_HORA_INI/FIM.
+const EXP_DIAS = (process.env.ATENDIMENTO_DIAS || '1,2,3,4,5').split(',').map(s => Number(s.trim())).filter(n => n >= 0 && n <= 6);
+const EXP_INI = Number(process.env.ATENDIMENTO_HORA_INI ?? 9);
+const EXP_FIM = Number(process.env.ATENDIMENTO_HORA_FIM ?? 18);
+const DIA_NOME = ['domingo', 'segunda-feira', 'terça-feira', 'quarta-feira', 'quinta-feira', 'sexta-feira', 'sábado'];
+
+export function expedienteConfig() {
+  return { dias: EXP_DIAS, horaIni: EXP_INI, horaFim: EXP_FIM };
+}
+
+// Dia da semana (0=dom) e hora no fuso de Brasília — NUNCA no do servidor (UTC).
+function diaEHoraBRT(d) {
+  const p = Object.fromEntries(new Intl.DateTimeFormat('en-US', {
+    timeZone: TIMEZONE, weekday: 'short', hour: 'numeric', minute: 'numeric', hourCycle: 'h23',
+  }).formatToParts(d).map(x => [x.type, x.value]));
+  const dow = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].indexOf(p.weekday);
+  return { dow, hora: Number(p.hour) + Number(p.minute) / 60 };
+}
+
+/**
+ * O time humano está atendendo agora? E quando é a próxima abertura?
+ * @returns {{ aberto: boolean, proxima: string, faixa: string }}
+ *   proxima: "hoje às 9h" | "amanhã às 9h" | "segunda-feira às 9h"
+ */
+export function expediente(agora = new Date()) {
+  const { dow, hora } = diaEHoraBRT(agora);
+  const faixa = `${EXP_INI}h às ${EXP_FIM}h`;
+  const aberto = EXP_DIAS.includes(dow) && hora >= EXP_INI && hora < EXP_FIM;
+  let proxima = null;
+  for (let i = 0; i <= 7 && !proxima; i++) {
+    const d = (dow + i) % 7;
+    if (!EXP_DIAS.includes(d)) continue;
+    if (i === 0 && hora >= EXP_INI) continue;   // hoje já abriu (ou já fechou)
+    proxima = `${i === 0 ? 'hoje' : i === 1 ? 'amanhã' : DIA_NOME[d]} às ${EXP_INI}h`;
+  }
+  return { aberto, proxima: proxima || `às ${EXP_INI}h`, faixa };
+}
+
 // Lista de calendários (closers). Aceita GHL_CALENDAR_IDS (CSV) ou GHL_CALENDAR_ID (único).
 export function getCalendarIds() {
   const multi = (process.env.GHL_CALENDAR_IDS || '').split(',').map(s => s.trim()).filter(Boolean);

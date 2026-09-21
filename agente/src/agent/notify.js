@@ -7,7 +7,7 @@
 import { db } from '../db/index.js';
 import { GHL } from '../ghl/client.js';
 import { UAZAPI } from '../uazapi/client.js';
-import { calendarName, slotModality } from './scheduling.js';
+import { calendarName, slotModality, expediente } from './scheduling.js';
 import { logger } from '../utils/logger.js';
 
 // Rótulo do aviso conforme a MODALIDADE do calendário em que caiu (a roleta mistura
@@ -61,11 +61,16 @@ async function notifyContactGHL(msg) {
   }
 }
 
-// Aviso de "lead quer falar AGORA" pro time / consultor da vez.
+// Aviso de "lead quer falar" pro time / consultor da vez.
+// ⚠️ O texto depende do EXPEDIENTE. Antes era sempre "🔥 Lead quer falar AGORA —
+// assumir o quanto antes", inclusive sábado à noite, pra lead a quem a Tina já
+// tinha dito "te chamamos na segunda" (Icá, 21/09: "no FDS a Tina mandou bastante
+// 'Lead quer falar AGORA' mesmo sendo final de semana. Tá certo isso?").
 export async function notifyLiveHandoff(contact, { consultant, funnel }) {
+  const exp = expediente();
   try {
     db.prepare(`INSERT INTO events_log (contact_id, kind, payload) VALUES (?, 'live_handoff_notify', ?)`)
-      .run(contact.id, JSON.stringify({ consultant: consultant?.name || consultant?.userId || null, funnel }));
+      .run(contact.id, JSON.stringify({ consultant: consultant?.name || consultant?.userId || null, funnel, foraExpediente: !exp.aberto }));
   } catch (err) {
     logger.error({ err: err.message, contactId: contact.id }, 'falha ao registrar aviso de live handoff');
   }
@@ -73,11 +78,22 @@ export async function notifyLiveHandoff(contact, { consultant, funnel }) {
   const nome = contact.name || 'Lead';
   const tel = contact.phone || '';
   const quem = consultant?.name || '(próximo da fila)';
-  const msg = `🔥 *Lead quer falar AGORA*\n`
-    + `👤 Lead: ${nome}${tel ? ` (${tel})` : ''}\n`
-    + `👨‍💼 ${agendaLabel().quem}: ${quem}\n`
-    + `${resumoLead(contact, funnel)}\n`
-    + `\n⚡ Assumir a conversa no WhatsApp o quanto antes.`;
+  const chegou = new Intl.DateTimeFormat('pt-BR', {
+    timeZone: process.env.GHL_TIMEZONE || 'America/Sao_Paulo',
+    weekday: 'long', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit',
+  }).format(new Date());
+  const msg = exp.aberto
+    ? `🔥 *Lead quer falar AGORA*\n`
+      + `👤 Lead: ${nome}${tel ? ` (${tel})` : ''}\n`
+      + `👨‍💼 ${agendaLabel().quem}: ${quem}\n`
+      + `${resumoLead(contact, funnel)}\n`
+      + `\n⚡ Assumir a conversa no WhatsApp o quanto antes.`
+    : `🌙 *Lead pediu contato — FORA do expediente*\n`
+      + `👤 Lead: ${nome}${tel ? ` (${tel})` : ''}\n`
+      + `👨‍💼 ${agendaLabel().quem}: ${quem}\n`
+      + `${resumoLead(contact, funnel)}\n`
+      + `🕘 Chegou: ${chegou}\n`
+      + `\n➡️ Retomar ${exp.proxima}. A Tina já avisou o lead que o atendimento é de seg a sex, ${exp.faixa}.`;
 
   await notifyGroupUazapi(msg);
   await notifyContactGHL(msg);
