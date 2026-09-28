@@ -125,6 +125,8 @@ app.get('/health', (_, res) => {
         // Distância máx. (dias) que o consultor da vez pode oferecer antes do
         // rodízio pular pro próximo. 0 = rodízio puro (sem pular por distância).
         maxAheadDays: Number(process.env.SCHEDULING_MAX_AHEAD_DAYS ?? 3),
+        // minutos ate checar se o agendamento realmente fechou (0 = desligado)
+        agendamentoCheckMin: Number(process.env.AGENDAMENTO_CHECK_MIN ?? 15),
         // Gates de atendimento — pra diagnosticar "Tina atendeu sem a tag/em outro funil".
         requiredTag: process.env.GHL_TAG_REQUIRED ?? 'tina-liberada',
         // A Tina cede o turno quando um humano responde? Sem isto ela entra por cima

@@ -103,6 +103,29 @@ export async function notifyLiveHandoff(contact, { consultant, funnel }) {
 // IA Tina) MAS a janela de 24h do WhatsApp está FECHADA — a Tina não pode
 // iniciar conversa fria (regra da Meta), então o time precisa dar o 1º toque.
 // Quando o lead responder, a Tina assume sozinha. Não-bloqueante.
+// Lead disse que queria agendar e o agendamento NÃO fechou. Sem este aviso ele
+// virava buraco negro: sem mensagem, sem follow-up e sem ninguém saber
+// (❌ caso Luiz Renato, 09/09 — queixa "lead não foi informado no grupo").
+export async function notifyAgendamentoTravado(contact, { desde } = {}) {
+  try {
+    db.prepare(`INSERT INTO events_log (contact_id, kind, payload) VALUES (?, 'agendamento_travado', ?)`)
+      .run(contact.id, JSON.stringify({ phone: contact.phone || null }));
+  } catch (err) {
+    logger.error({ err: err.message, contactId: contact.id }, 'falha ao registrar agendamento_travado');
+  }
+  const nome = contact.name || 'Lead';
+  const tel = contact.phone || '';
+  const quando = desde
+    ? new Intl.DateTimeFormat('pt-BR', { timeZone: process.env.GHL_TIMEZONE || 'America/Sao_Paulo', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }).format(new Date(desde))
+    : null;
+  const msg = `⏳ *Agendamento não foi concluído*\n`
+    + `👤 ${nome}${tel ? ` (${tel})` : ''}\n`
+    + `O lead pediu pra agendar${quando ? ` (${quando})` : ''}, mas nenhuma reunião foi marcada.\n`
+    + `👉 Alguém do time precisa retomar e fechar o horário com ele.`;
+  await notifyGroupUazapi(msg);
+  await notifyContactGHL(msg);
+}
+
 export async function notifyIaTinaForaJanela(contact) {
   try {
     db.prepare(`INSERT INTO events_log (contact_id, kind, payload) VALUES (?, 'ia_tina_fora_janela', ?)`)

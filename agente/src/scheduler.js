@@ -3,7 +3,7 @@ import { GHL } from './ghl/client.js';
 import { resumeIA, closeLeadNoResponse } from './agent/handoff.js';
 import { recordOutbound } from './agent/contactService.js';
 import { markTinaSent } from './agent/messenger.js';
-import { sendResumoDiaGroup } from './agent/notify.js';
+import { sendResumoDiaGroup, notifyAgendamentoTravado } from './agent/notify.js';
 import { sweepOrganico } from './agent/organicoSweep.js';
 import { upcomingAppointment } from './agent/scheduling.js';
 import { contactWorkedByOtherTeam } from './ghl/opportunities.js';
@@ -22,7 +22,7 @@ const CLOSE_HOURS = Number(process.env.FOLLOWUP_CLOSE_HOURS ?? 48);
 // tenha 5 follow-ups acumulados, manda só 1 mensagem e marca todos como sent.
 async function processFollowups() {
   const due = db.prepare(`
-    SELECT f.*, c.id as contact_id, c.ghl_contact_id, c.name, c.ai_paused, c.stage, c.last_inbound_at
+    SELECT f.*, c.id as contact_id, c.ghl_contact_id, c.name, c.phone, c.ai_paused, c.stage, c.last_inbound_at
     FROM followups f
     JOIN contacts c ON c.id = f.contact_id
     WHERE f.sent = 0 AND f.due_at <= datetime('now')
@@ -63,6 +63,20 @@ async function processFollowups() {
       // formulário dizendo que já publicou e quer divulgar.
       if (await contactWorkedByOtherTeam({ id: f.contact_id, ghl_contact_id: f.ghl_contact_id })) {
         logger.info({ contactId: f.contact_id }, 'follow-up cancelado: lead está com outro time');
+        continue;
+      }
+
+      // AGENDAMENTO TRAVADO: o lead pediu pra agendar e, passado o prazo, nenhuma
+      // reunião foi marcada. NÃO manda mensagem pro lead — avisa o TIME, que antes
+      // não ficava sabendo de nada (queixa "lead não foi informado no grupo").
+      // Roda depois do gate de reunião futura acima: se fechou, nem chega aqui.
+      if (f.reason === 'agendamento_travado') {
+        if (f.stage === 'agendado') continue;              // fechou no meio do caminho
+        logger.warn({ contactId: f.contact_id }, 'agendamento travado — avisando o time');
+        await notifyAgendamentoTravado(
+          { id: f.contact_id, ghl_contact_id: f.ghl_contact_id, name: f.name, phone: f.phone },
+          { desde: f.created_at },
+        ).catch(err => logger.warn({ err: err.message, contactId: f.contact_id }, 'falha avisando agendamento travado'));
         continue;
       }
 

@@ -352,10 +352,11 @@ Neste momento NÃO há nenhum horário livre na agenda do time.
 
 - ❌ **NÃO ofereça horário nenhum.** Você não tem horários pra oferecer. Não diga "consigo às 11h", não derive horário do que o lead falou, não chute.
 - ❌ **NÃO diga que agendou, marcou, reservou ou encaixou.** Nada foi marcado — dizer isso faz o lead esperar uma ligação que não vai acontecer.
-- ✅ Diga com naturalidade que vai **confirmar a melhor janela com o time** e que ele retorna com o horário.
+- 🚫 **NÃO diga "vou verificar com a equipe" nem "vou confirmar a melhor janela com o time"** (regra LC 25/09). Isso empurra o lead pra um limbo: ele fica esperando um retorno que pode não vir.
+- ✅ Em vez disso, **PEÇA UM DIA ÚTIL**: diga que o time atende de segunda a sexta e pergunte qual dia da semana funciona melhor pra ele. Assim a conversa avança e no próximo turno você já recebe os horários reais.
 - ✅ Marque \`handoff: true\` e \`stage: "qualificado"\` — o consultor humano assume e fecha o horário.
 
-Exemplo: "Perfeito, [nome]! Vou confirmar a melhor janela com o nosso time e já te retorno com o horário certinho, pode ser? 😊"
+Exemplo: "Perfeito, [nome]! Nosso time atende de segunda a sexta — qual dia da semana fica melhor pra você? Assim já deixo reservado 😊"
 `.trim();
 
 // Registra os horários oferecidos (com o calendário de cada um) pra na hora

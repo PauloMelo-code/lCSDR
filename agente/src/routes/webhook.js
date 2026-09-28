@@ -282,6 +282,28 @@ async function conversationAlreadyInAttendance(ghlContactId, windowMs) {
   }
 }
 
+// Minutos até checar se o agendamento REALMENTE fechou depois que o lead disse
+// "quero agendar". 0 desliga a checagem.
+const CHECAGEM_AGENDAMENTO_MIN = Number(process.env.AGENDAMENTO_CHECK_MIN ?? 15);
+
+// O lead escolheu AGENDAR — agenda uma checagem pra daqui a pouco.
+// ⚠️ Antes este ramo cancelava TODOS os follow-ups pendentes e não avisava ninguém:
+// quem pedia pra agendar e não fechava virava buraco negro — sem mensagem, sem
+// follow-up e sem aviso pro time. ❌ CASO REAL (Luiz Renato, 09/09 17:39): a
+// conversa parou no meio do agendamento e ninguém soube. Agora, se daqui a
+// CHECAGEM_AGENDAMENTO_MIN ele ainda estiver em 'agendando' sem reunião marcada,
+// o time é avisado (scheduler.js).
+function marcarChecagemAgendamento(contactId) {
+  db.prepare('UPDATE followups SET sent = 1 WHERE contact_id = ? AND sent = 0').run(contactId);
+  if (!(CHECAGEM_AGENDAMENTO_MIN > 0)) return;
+  try {
+    db.prepare(`INSERT INTO followups (contact_id, due_at, reason) VALUES (?, ?, 'agendamento_travado')`)
+      .run(contactId, new Date(Date.now() + CHECAGEM_AGENDAMENTO_MIN * 60_000).toISOString());
+  } catch (err) {
+    logger.warn({ err: err.message, contactId }, 'falha agendando checagem de agendamento travado');
+  }
+}
+
 // ⚠️ ÚNICA FONTE DE VERDADE sobre "quem mandou esta saída" (invariante #8).
 // O `userId` NÃO serve como discriminador e, nesta conta da LC, está INVERTIDO:
 //   - as saídas da TINA vêm com o userId do DONO do contato (o GHL carimba assim),
@@ -712,7 +734,7 @@ export async function handleOpportunityStage(event) {
         await notifyLiveHandoff(fresh, { consultant: lh?.consultant, funnel: result.funnel || fresh.funnel }).catch(() => {});
       } else if (result.handoff_mode === 'agendar' && SCHED) {
         db.prepare(`UPDATE contacts SET stage = 'agendando', updated_at = CURRENT_TIMESTAMP WHERE id = ?`).run(fresh.id);
-        db.prepare('UPDATE followups SET sent = 1 WHERE contact_id = ? AND sent = 0').run(fresh.id);
+        marcarChecagemAgendamento(fresh.id);
         await markQualifiedAndHandoff(fresh, result, { pause: false }).catch(() => {});
       } else if (result.handoff || result.stage === 'qualificado') {
         await markQualifiedAndHandoff(fresh, result, { pause: false }).catch(() => {});
@@ -1034,7 +1056,25 @@ async function handleInbound(event) {
     // o horário que o lead propôs, dizia "confirmei", não preenchia book_slot, e nada
     // era criado na agenda nem avisado no grupo. Por isso 'qualificado' entra aqui:
     // é o stage em que o lead está quando responde "quero agendar".
-    if (schedulingEnabled() && ['agendando', 'qualificado'].includes(fresh.stage)) {
+    // O LEAD JÁ PEDIU HORÁRIO? Então busca a lista AGORA, mesmo que ele ainda não
+    // tenha sido qualificado. ❌ CASO REAL (Lunnah, domingo 06/09): a 2ª mensagem
+    // dela, 30s depois da 1ª, já era "somente hoje as 17 horas" — como o stage ainda
+    // era 'novo', a Tina respondeu SEM lista nenhuma e disse "vou confirmar essa
+    // janela com a nossa equipe". O lead ficou esperando um retorno que não veio.
+    // Pede horário de propósito de forma CONSERVADORA: número solto não conta
+    // ("tenho 2 livros", "publiquei em 2024", "moro aqui há 15 anos" não disparam).
+    // Só conta com marcador de hora (14h, 14:30, "às 11", "11 da manhã") ou com
+    // palavra de agendamento.
+    const INTENCAO_AGENDA = new RegExp([
+      String.raw`\b(agendar|marcar|remarcar|hor[áa]rio|hor[áa]rios|reuni[ãa]o)\b`,
+      String.raw`\b\d{1,2}\s*(?:h\b|hs\b|horas\b|:\d{2})`,
+      // ⚠️ sem \b antes de "à": em JS o "à" não é caractere de palavra, então
+      // /\bàs/ NUNCA casa depois de um espaço.
+      String.raw`(?:^|\s)às\s*\d{1,2}\b`,
+      String.raw`\b\d{1,2}\s*da\s+(?:manh[ãa]|tarde|noite)\b`,
+    ].join('|'), 'i');
+    const pediuHorario = INTENCAO_AGENDA.test(content || '') && !['desqualificado', 'agendado'].includes(fresh.stage);
+    if (schedulingEnabled() && (['agendando', 'qualificado'].includes(fresh.stage) || pediuHorario)) {
       // leque de horários (manhã/tarde, próximos dias) pra atender pedidos
       // específicos do lead sem inventar. A Tina oferece os mais cedo por padrão.
       // Leitura crítica e curso NÃO vão pros closers — só Gabriel e Bruna (LC 25/09).
@@ -1216,7 +1256,15 @@ async function handleInbound(event) {
         WHERE id = ?
       `).run(
         result.funnel || null,
-        result.stage || null,
+        // ⚠️ Quando ela QUALIFICA, o stage é forçado pra 'qualificado' — não fica
+        // na mão do modelo. A lista de horários do próximo turno depende deste
+        // campo (gate acima), mas o roteamento depende de `result.handoff`. Quando
+        // o modelo marcava handoff:true e deixava o stage em 'qualificando', o
+        // turno seguinte — justo aquele em que o lead responde com dia/hora —
+        // rodava SEM lista, e ela caía no "vou verificar com a equipe".
+        (result.handoff && !['agendando', 'agendado', 'desqualificado'].includes(result.stage || fresh.stage))
+          ? 'qualificado'
+          : (result.stage || null),
         result.qualification_score || fresh.qualification_score || 0,
         result.qualification_notes || null,
         result.service_recommended || null,
@@ -1305,7 +1353,7 @@ async function handleInbound(event) {
     } else if (result.handoff_mode === 'agendar' && SCHED) {
       // AGENDAR: entra em "agendando", MANTÉM a IA ativa pra puxar horários e marcar.
       db.prepare(`UPDATE contacts SET stage = 'agendando', updated_at = CURRENT_TIMESTAMP WHERE id = ?`).run(fresh.id);
-      db.prepare('UPDATE followups SET sent = 1 WHERE contact_id = ? AND sent = 0').run(fresh.id);
+      marcarChecagemAgendamento(fresh.id);
       await markQualifiedAndHandoff(fresh, result, { pause: false }).catch(err =>
         logger.error({ err: err.message }, 'markQualifiedAndHandoff (agendando) falhou'));
 
