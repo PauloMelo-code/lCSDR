@@ -945,10 +945,16 @@ async function handleInbound(event) {
     try {
       const buf = attBuf || (primaryUrl ? await downloadAttachment(primaryUrl) : null);
       const transcript = buf ? await transcribeAudioBuffer(buf) : null;
-      content = transcript ? `[áudio transcrito] ${transcript}` : '[áudio recebido — falha na transcrição]';
+      // ⚠️ Quando NÃO dá pra ouvir, o marcador tem que INSTRUIR a Tina a avisar o
+      // lead (pedido da LC 25/09: "se a Tina não pode ouvir áudio, é importante
+      // avisar o lead para não enviar"). Antes vinha só "[falha na transcrição]" e
+      // ela respondia como se nada tivesse chegado — o lead mandava áudio de novo.
+      content = transcript
+        ? `[áudio transcrito] ${transcript}`
+        : '[o lead mandou um ÁUDIO e você NÃO conseguiu ouvir. Peça desculpas com naturalidade, explique que por aqui você não consegue ouvir áudios e peça pra ele escrever o mesmo por texto. NÃO ignore o áudio nem finja que entendeu.]';
     } catch (err) {
       logger.error({ err: err.message }, 'falha baixando/transcrevendo áudio');
-      content = '[áudio recebido — não consegui ouvir]';
+      content = '[o lead mandou um ÁUDIO e você NÃO conseguiu ouvir. Peça desculpas com naturalidade, explique que por aqui você não consegue ouvir áudios e peça pra ele escrever o mesmo por texto. NÃO ignore o áudio nem finja que entendeu.]';
     }
     content_type = 'audio_transcript';
   }

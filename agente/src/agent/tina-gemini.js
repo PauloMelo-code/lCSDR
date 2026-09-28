@@ -210,6 +210,40 @@ async function generateWithRetry(req, retries = 2) {
 // Descreve uma imagem que o lead enviou, usando a visão multimodal do Gemini.
 // Roda no webhook (igual ao Whisper pro áudio): vira texto e entra no
 // histórico como contexto. Retorna 1-2 frases ou null se não der.
+// Transcreve áudio do lead pelo Gemini — alternativa ao Whisper.
+// ⚠️ Existe porque o Whisper depende da OPENAI_API_KEY e, quando ela expira, a Tina
+// para de ouvir áudio SEM NINGUÉM PERCEBER: o chat roda no Gemini e continua normal,
+// então só o áudio (e o plano B do chat) quebram. Foi o que aconteceu — Whisper
+// devolvendo 401 invalid_api_key, e a queixa "não está ouvindo os áudios" (LC 25/09).
+export async function transcribeAudioBufferGemini(buffer, mime = 'audio/ogg') {
+  if (!process.env.GEMINI_API_KEY) return null;
+  if (!buffer || !buffer.length) return null;
+  try {
+    const resp = await generateWithRetry({
+      model: MODEL,
+      contents: [{
+        role: 'user',
+        parts: [
+          { inlineData: { mimeType: mime, data: buffer.toString('base64') } },
+          { text: 'Transcreva EXATAMENTE o que a pessoa fala neste áudio, em português do Brasil. Responda só a transcrição, sem preâmbulo, sem aspas e sem comentários. Se não houver fala audível, responda apenas: VAZIO' },
+        ],
+      }],
+      config: {
+        temperature: 0,
+        maxOutputTokens: 800,
+        thinkingConfig: { thinkingLevel: 'low' },
+        abortSignal: AbortSignal.timeout(30_000),
+      },
+    });
+    const t = (resp.text || '').trim();
+    if (!t || /^vazio$/i.test(t)) return null;
+    return t;
+  } catch (err) {
+    logger.error({ err: err.message }, 'falha ao transcrever áudio (Gemini)');
+    return null;
+  }
+}
+
 export async function describeImageBuffer(buffer, mime = 'image/jpeg') {
   if (!process.env.GEMINI_API_KEY) {
     logger.warn('GEMINI_API_KEY ausente — descrição de imagem pulada');
