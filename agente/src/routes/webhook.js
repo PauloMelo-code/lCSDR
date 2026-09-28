@@ -16,7 +16,7 @@ import {
 } from '../agent/handoff.js';
 import {
   schedulingEnabled, getNextSlots, slotsContextBlock, bookSlot, recordOffer,
-  upcomingAppointment, NO_SLOTS_CONTEXT,
+  upcomingAppointment, NO_SLOTS_CONTEXT, calendariosParaServico,
 } from '../agent/scheduling.js';
 import { bookSearchEnabled, searchBookLink } from '../agent/bookSearch.js';
 import { contactOppOutsideTinaLane, moveLeadToIaTina, claimToIaTina, resolvePipeline, contactInIaTinaLane, contactOppInReentrada, contactWorkedByOtherTeam, contactExclusivelyInTinaLane, closeSdrOppOnBooking, contactIsConvertedCustomer } from '../ghl/opportunities.js';
@@ -1027,7 +1027,11 @@ async function handleInbound(event) {
     if (schedulingEnabled() && ['agendando', 'qualificado'].includes(fresh.stage)) {
       // leque de horários (manhã/tarde, próximos dias) pra atender pedidos
       // específicos do lead sem inventar. A Tina oferece os mais cedo por padrão.
-      const slots = await getNextSlots(8, { spread: true });
+      // Leitura crítica e curso NÃO vão pros closers — só Gabriel e Bruna (LC 25/09).
+      // Usa o serviço já identificado no contato (ou o da última nota de qualificação).
+      const apenasCalendarios = calendariosParaServico(fresh.service_recommended || fresh.funnel_service || null);
+      if (apenasCalendarios) logger.info({ contactId: fresh.id }, 'serviço de leitura crítica/curso — agenda restrita a Gabriel e Bruna');
+      const slots = await getNextSlots(8, { spread: true, apenasCalendarios });
       if (slots.length) {
         extraContext = slotsContextBlock(slots);
         recordOffer(fresh.id, slots);  // guarda qual closer tem cada horário
@@ -1162,13 +1166,17 @@ async function handleInbound(event) {
     }
 
     // 9) Atualiza estado do contato
-    if (result.funnel || result.stage) {
+    // service_recommended é gravado pra durar entre os turnos: os horários são
+    // buscados ANTES da resposta do LLM, então o roteamento de agenda (leitura
+    // crítica/curso só com Gabriel e Bruna) precisa do serviço do turno anterior.
+    if (result.funnel || result.stage || result.service_recommended) {
       db.prepare(`
         UPDATE contacts
         SET funnel = COALESCE(?, funnel),
             stage = COALESCE(?, stage),
             qualification_score = ?,
             qualification_notes = COALESCE(?, qualification_notes),
+            service_recommended = COALESCE(?, service_recommended),
             updated_at = CURRENT_TIMESTAMP
         WHERE id = ?
       `).run(
@@ -1176,6 +1184,7 @@ async function handleInbound(event) {
         result.stage || null,
         result.qualification_score || fresh.qualification_score || 0,
         result.qualification_notes || null,
+        result.service_recommended || null,
         fresh.id
       );
     }

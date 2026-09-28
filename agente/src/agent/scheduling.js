@@ -210,9 +210,21 @@ function spreadPick(slots, count) {
 // Cada lead é atendido por um consultor da vez; oferece os horários DELE.
 // Se o consultor da vez não tiver horário, passa pro próximo da roleta.
 // Retorna [{ iso, label, calendarId }] de UM consultor, ordenado.
-export async function getNextSlots(count = 3, { fromDate = new Date(), spread = true } = {}) {
+// Serviços que NÃO vão pros closers: leitura crítica e cursos são atendidos só
+// pelo Gabriel e pela Bruna (regra LC 25/09). Reaproveita a lista de calendários
+// de pré-atendimento, que já é exatamente esses dois.
+const SERVICOS_PRE_ATENDIMENTO = /leitura_critica|curso_/i;
+export function calendariosParaServico(servico) {
+  if (!servico || !SERVICOS_PRE_ATENDIMENTO.test(servico)) return null;   // null = todos
+  const ids = preAtendimentoCalendarIds().filter(id => getCalendarIds().includes(id));
+  return ids.length ? ids : null;   // se não estiverem no rodízio, não trava o agendamento
+}
+
+export async function getNextSlots(count = 3, { fromDate = new Date(), spread = true, apenasCalendarios = null } = {}) {
   if (!schedulingEnabled()) return [];
-  const calendarIds = getCalendarIds();
+  const calendarIds = apenasCalendarios?.length
+    ? getCalendarIds().filter(id => apenasCalendarios.includes(id))
+    : getCalendarIds();
   const startMs = fromDate.getTime();
   const endMs = startMs + LOOKAHEAD_DAYS * 24 * 60 * 60 * 1000;
 

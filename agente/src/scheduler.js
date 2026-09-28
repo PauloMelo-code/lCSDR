@@ -83,8 +83,13 @@ async function processFollowups() {
         continue;
       }
 
-      const nome = (f.name || '').split(' ')[0];
-      const saudacao = nome ? `Oi ${nome}, ` : 'Oi, ';
+      // ⚠️ NÃO usa o nome cru do contato. O WhatsApp entrega coisas como
+      // "mariozeferino698", "216681834" ou o próprio telefone como nome — e o
+      // follow-up saía "Oi mariozeferino698," (queixa da LC 25/09: "usou nome de
+      // contato, ela não devia responder dessa forma"). Sem nome válido, saúda sem nome.
+      const primeiro = (f.name || '').trim().split(/\s+/)[0] || '';
+      const nomeValido = primeiro.length >= 2 && !/\d/.test(primeiro) && !/^[\W_]+$/.test(primeiro);
+      const saudacao = nomeValido ? `Oi ${primeiro}, ` : 'Oi, ';
       // Textos reescritos (queixa do Gabriel, 25/08): o follow-up antigo abria com
       // "dei uma sumida, me desculpa" — a Tina se acusava de sumir, o lead não
       // entendia do que se tratava e respondia "?" ou "não entendi". Agora ela se

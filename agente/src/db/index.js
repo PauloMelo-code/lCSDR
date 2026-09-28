@@ -55,6 +55,9 @@ export function runSchema() {
   safeAddColumn('contacts', 'ia_tina_self_moved_at', 'DATETIME');
   safeAddColumn('contacts', 'ia_tina_self_moved_opp', 'TEXT');   // opp id da própria movimentação (anti-loop por id, não só por tempo)
   safeAddColumn('contacts', 'ia_tina_continuation_at', 'DATETIME');
+  // serviço identificado pela Tina — usado pra rotear a agenda (leitura crítica e
+  // curso só vão pra Gabriel/Bruna, nunca pros closers; regra LC 25/09)
+  safeAddColumn('contacts', 'service_recommended', 'TEXT');
 }
 
 // Garante schema na primeira importação
