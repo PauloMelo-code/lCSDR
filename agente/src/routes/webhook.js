@@ -270,10 +270,8 @@ async function conversationAlreadyInAttendance(ghlContactId, windowMs) {
     const limiteMs = win > 0 ? Date.now() - win : 0;
     return msgs.some(m => {
       const dir = (m.direction || '').toLowerCase();
-      const uid = m.userId || m.user_id || m.sentBy?.id;
-      const src = String(m.source || '').toLowerCase();
-      if (dir !== 'outbound' || !uid) return false;   // só humano tem userId; Tina = null
-      if (AUTO_SOURCES.has(src)) return false;         // workflow/campanha não é humano atendendo
+      if (dir !== 'outbound') return false;
+      if (!outboundEhHumano(m)) return false;          // por PROCEDÊNCIA, não por userId
       if (!limiteMs) return true;                      // sem janela → qualquer idade conta
       const ts = new Date(m.dateAdded || m.createdAt || m.date || 0).getTime();
       return ts ? ts >= limiteMs : false;              // sem data confiável → não bloqueia (lado seguro p/ atender)
@@ -282,6 +280,28 @@ async function conversationAlreadyInAttendance(ghlContactId, windowMs) {
     logger.warn({ err: err.message, ghlContactId }, 'falha checando atendimento prévio; segue normal');
     return false;
   }
+}
+
+// ⚠️ ÚNICA FONTE DE VERDADE sobre "quem mandou esta saída" (invariante #8).
+// O `userId` NÃO serve como discriminador e, nesta conta da LC, está INVERTIDO:
+//   - as saídas da TINA vêm com o userId do DONO do contato (o GHL carimba assim),
+//     ou seja, com o id de um HUMANO;
+//   - as saídas do consultor vêm com userId VAZIO, porque ele escreve por uma
+//     ferramenta externa que grava no GHL sem userId.
+// Por isso quatro pontos do código liam o mundo ao contrário: tratavam a própria
+// Tina como "humano atendendo" e o consultor como "API". ❌ CASO REAL (16/09): o
+// Gabriel estava na conversa e a Tina entrou por cima, mandando 6 mensagens.
+// A PROCEDÊNCIA resolve: todo envio da Tina é registrado em tina_sent_msgs
+// (markTinaSent). Saída que NÃO está lá e não é automação = humano.
+function outboundEhHumano(msg) {
+  const id = msg?.id || msg?.messageId || msg?._id;
+  if (id && isTinaSentMessage(id)) return false;                 // foi a Tina
+  const src = String(msg?.source || '').toLowerCase();
+  if (AUTO_SOURCES.has(src)) return false;                       // workflow/campanha
+  // Sem id não dá pra provar procedência: cai no sinal antigo (userId de SDR
+  // conhecido), que é fraco mas é o que resta — nunca tratar como humano no escuro.
+  if (!id) return isKnownSdrUserId(msg?.userId || msg?.user_id || msg?.sentBy?.id);
+  return true;                                                   // não foi a Tina nem automação
 }
 
 function isKnownSdrUserId(userId) {
@@ -316,22 +336,12 @@ async function lastOutboundWasHuman(ghlContactId, localContact) {
     // do contato — então userId NÃO distingue Tina de humano. O único sinal
     // confiável é a procedência: se ESTE messageId foi enviado pela própria Tina
     // (registrado em tina_sent_msgs no envio), não é humano.
-    const outId = lastOut.id || lastOut.messageId || lastOut._id;
-    if (outId && isTinaSentMessage(outId)) return false;
-
-    // Automação (workflow/campanha) também não é atendimento humano.
-    if (AUTO_SOURCES.has(String(lastOut.source || '').toLowerCase())) return false;
-
-    const userId = lastOut.userId || lastOut.user_id || lastOut.sentBy?.id;
-
-    // Confirmação secundária (janela de transição): saídas que a Tina mandou ANTES
-    // deste recurso não estão no tina_sent_msgs. Pra não tratar essas como humano,
-    // só conta como humano se o userId for de um SDR conhecido — senão é API/Tina.
-    // (A partir do deploy, o caso comum já é resolvido pela procedência acima.)
-    if (!isKnownSdrUserId(userId)) {
-      logger.debug({ userId }, 'saída sem procedência Tina e userId não é SDR conhecido — assumindo API');
-      return false;
-    }
+    // ⚠️ Antes esta função EXIGIA userId de SDR conhecido como confirmação — e era
+    // justamente isso que a derrubava: o consultor escreve por ferramenta externa e
+    // a saída dele chega SEM userId, então ela concluía "assumindo API" e a Tina
+    // seguia por cima dele. Agora o veredito é só procedência (a sanidade de
+    // timestamp contra o nosso last_outbound_at continua logo abaixo).
+    if (!outboundEhHumano(lastOut)) return false;
 
     // Recência (modo cooldown, opt-in via SKIP_ATTENDANCE_HOURS): se o consultor
     // conhecido falou há MAIS que a janela ativa, ele "largou" o lead → a Tina
@@ -491,10 +501,10 @@ async function syncConversationFromGHL(contact) {
       const text = (body || '').trim();
       if (!text) continue; // pula mídia-only / sem texto
 
-      const uid = x.userId || x.user_id || x.sentBy?.id;
-      const isHuman = !!uid && !AUTO_SOURCES.has(String(x.source || '').toLowerCase());
-      // Saída sem userId = Tina via API (já está local) → não reimporta.
-      if (dir === 'outbound' && !isHuman) continue;
+      // Só reimporta saída de HUMANO (a da Tina já está no banco local).
+      // Antes usava `!!uid` e jogava fora justamente as falas do consultor, que
+      // vêm sem userId — o histórico chegava ao modelo sem o que o humano disse.
+      if (dir === 'outbound' && !outboundEhHumano(x)) continue;
       const author = dir === 'inbound' ? 'lead' : 'sdr';
 
       const gid = x.id || x.messageId;
@@ -1137,6 +1147,31 @@ async function handleInbound(event) {
       }
     }
 
+    // 7.6) TRAVA DE PROMESSA: o texto NÃO pode afirmar que agendou se nada foi criado.
+    // A trava de data acima só roda quando a reunião EXISTE. Faltava o caso inverso —
+    // e é o mais caro: quando o agendamento falha (book_slot vazio, bookSlot ok:false,
+    // ou erro na API do GHL), o código só logava o erro e MANDAVA o texto assim mesmo,
+    // que a essa altura já dizia "agendei". ❌ CASO REAL (Emerson, 11/09): "Já agendei
+    // aqui pro nosso especialista te chamar hoje, às 09:00" — nunca existiu reunião
+    // nenhuma, em calendário nenhum, e o lead ficou esperando.
+    // Aqui o código confronta o que ela escreveu com o que de fato aconteceu.
+    const AFIRMA_AGENDOU = /\b(agendei|agendado|agendada|marquei|marcado|marcada|reservei|reservado|reservada|confirmei|deixei reservado|est[áa] agendad)/i;
+    if (!booked?.ok) {
+      const idx = items.map(x => (typeof x === 'string' ? x : x?.text || '')).findLastIndex(t => AFIRMA_AGENDOU.test(t));
+      if (idx >= 0) {
+        const primeiro = (fresh.name || '').trim().split(/\s+/)[0];
+        items[idx] = `Só um instante${primeiro ? ', ' + primeiro : ''}! Ainda não consegui confirmar esse horário na agenda aqui do nosso time. Vou verificar com o especialista e já te confirmo por aqui, tá? 🙏`;
+        logger.error({ contactId: fresh.id, motivo: booked?.error || 'sem book_slot', textoRemovido: String(items[idx]).slice(0, 120) },
+          'PROMESSA SEM AGENDAMENTO: a Tina disse que agendou mas nada foi criado — texto corrigido e time avisado');
+        try {
+          db.prepare(`INSERT INTO events_log (contact_id, kind, payload) VALUES (?, 'promessa_sem_agendamento', ?)`)
+            .run(fresh.id, JSON.stringify({ motivo: booked?.error || 'sem book_slot' }));
+        } catch {}
+        // O time PRECISA saber: o lead ficou esperando um horário que não existe.
+        await notifyIaTinaForaJanela(fresh).catch(() => {});
+      }
+    }
+
     // 8) Envia resposta(s)
     // ⚠️ TURNO MUDO: estas duas guardas existiam SÓ no caminho de continuidade
     // (linhas ~653-667). No fluxo principal o retorno do sendSequence era ignorado,
@@ -1325,10 +1360,13 @@ async function handleOutbound(event) {
   const contact = db.prepare('SELECT * FROM contacts WHERE ghl_contact_id = ?').get(ghlContactId);
   if (!contact) return;
 
-  // Se veio com userId, foi humano do GHL (UI ou mobile) quem respondeu.
-  // Quando a gente envia via API com PIT, o GHL NÃO preenche userId → não entra aqui.
+  // HUMANO ASSUMIU? Decide por PROCEDÊNCIA, não por userId.
+  // ⚠️ O teste antigo era `if (event.userId)` — quebrado nos DOIS sentidos nesta
+  // conta: as saídas da Tina vêm COM userId (do dono do contato), então ela se
+  // auto-pausaria; e as do consultor vêm SEM userId, então ele nunca pausava nada.
+  // Este é o único caminho que pausa a IA no meio da conversa, e ele estava inerte.
   const humanUserId = event.userId || event.user_id;
-  if (humanUserId) {
+  if (outboundEhHumano(event)) {
     // Tenta linkar com SDR local (se já conhecemos o ghl_user_id)
     const sdr = db.prepare('SELECT id FROM sdr_users WHERE ghl_user_id = ?').get(humanUserId);
     handleSDRReply(contact.id, sdr?.id || null);

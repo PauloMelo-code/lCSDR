@@ -127,6 +127,10 @@ app.get('/health', (_, res) => {
         maxAheadDays: Number(process.env.SCHEDULING_MAX_AHEAD_DAYS ?? 3),
         // Gates de atendimento — pra diagnosticar "Tina atendeu sem a tag/em outro funil".
         requiredTag: process.env.GHL_TAG_REQUIRED ?? 'tina-liberada',
+        // A Tina cede o turno quando um humano responde? Sem isto ela entra por cima
+        // do consultor (caso 16/09). Estava fora do /health contra a regra do projeto.
+        autoHumanDetection: process.env.AUTO_HUMAN_DETECTION_ENABLED === 'true',
+        skipLeadsInAttendance: process.env.SKIP_LEADS_IN_ATTENDANCE !== 'false',
         // ⚠️ o webhook lê TINA_ATTEND_EXCEPT_REENTRADA (com prefixo). Sem o prefixo
         // aqui, o /health reportava sempre false mesmo com o modo ligado.
         attendExceptReentrada: process.env.TINA_ATTEND_EXCEPT_REENTRADA === 'true',
