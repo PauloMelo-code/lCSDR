@@ -127,6 +127,8 @@ app.get('/health', (_, res) => {
         maxAheadDays: Number(process.env.SCHEDULING_MAX_AHEAD_DAYS ?? 3),
         // minutos ate checar se o agendamento realmente fechou (0 = desligado)
         agendamentoCheckMin: Number(process.env.AGENDAMENTO_CHECK_MIN ?? 15),
+        // exige e-mail sempre; link de vendas so no funil divulgar (invariante 12)
+        exigeLinkDivulgacao: process.env.EXIGIR_LINK_DIVULGACAO !== 'false',
         // Gates de atendimento — pra diagnosticar "Tina atendeu sem a tag/em outro funil".
         requiredTag: process.env.GHL_TAG_REQUIRED ?? 'tina-liberada',
         // A Tina cede o turno quando um humano responde? Sem isto ela entra por cima

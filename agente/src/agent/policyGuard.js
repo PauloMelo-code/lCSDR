@@ -101,6 +101,70 @@ function applyFixesToText(text, violations) {
   return out.replace(/\s{2,}/g, ' ').replace(/\s+([,.;:!?])/g, '$1').trim();
 }
 
+// ─── NÃO PEÇA O QUE O LEAD JÁ RESPONDEU (regra LC, a queixa mais reincidente) ───
+// Aparece 8 vezes no documento da LC: "questionando o que o lead já havia
+// informado", "não pode ficar repetindo a mesma pergunta", "pergunta de novo
+// depois de o lead confirmar", "falou do @ 8 vezes na mesma conversa", "não
+// completou a frase e se identificou de novo". Até aqui só havia regra no prompt —
+// e o modelo desobedece. Estas são travas: o texto é corrigido ANTES de sair.
+//
+// Recorta a FRASE (não a bolha inteira) que contém a pergunta indevida.
+function removerFrase(texto, teste) {
+  const frases = String(texto).split(/(?<=[.!?…])\s+/);
+  const mantidas = frases.filter(f => !teste(f));
+  if (!mantidas.length) return '';
+  return mantidas.join(' ').replace(/\s{2,}/g, ' ').trim();
+}
+
+const PERGUNTA_EMAIL = /\be-?mail\b/i;
+const REAPRESENTACAO = /\baqui\s+[ée]\s+a\s+tina\b|\bsou a tina\b|\bmeu nome [ée] tina\b/i;
+
+// Aplica só o que depende do ESTADO do contato (por isso fora do FIXES genérico).
+function aplicarTravasDeContexto(result, contact, violations) {
+  const jaTemEmail = !!(contact?.email && /@/.test(contact.email));
+  const jaConversou = !!contact?.last_outbound_at;
+  if (!jaTemEmail && !jaConversou) return;
+
+  // snapshot pra poder desfazer se a limpeza esvaziar a mensagem
+  const antes = { reply: result.reply, split: Array.isArray(result.split) ? [...result.split] : result.split };
+
+  eachText(result, texto => {
+    if (!texto) return texto;
+    let out = texto;
+
+    // 1) Pedir e-mail que já temos. ❌ ERRO REAL: o lead mandou o e-mail e a Tina
+    // pediu de novo 11 segundos depois.
+    // Tira a BOLHA inteira, não só a frase: recortar só a pergunta deixava órfã a
+    // frase que a explicava ("É pra onde vai o convite."), sem sentido sozinha.
+    if (jaTemEmail && PERGUNTA_EMAIL.test(out) && /\?/.test(out)) {
+      violations.push('repetiu_pergunta_email');
+      out = '';
+    }
+
+    // 2) Se reapresentar no meio da conversa. ❌ ERRO REAL: se apresentou 8 vezes
+    // na mesma conversa e a lead pediu atendimento humano 3 vezes.
+    if (jaConversou && REAPRESENTACAO.test(out)) {
+      const semApresentacao = removerFrase(out, f => REAPRESENTACAO.test(f));
+      if (semApresentacao !== out) { violations.push('reapresentacao'); out = semApresentacao; }
+    }
+
+    return out;
+  });
+
+  // Rede de segurança: se as travas esvaziaram TUDO, DESFAZ — melhor uma mensagem
+  // redundante do que a Tina muda (o turno mudo é uma falha pior que a repetição).
+  if (!allTextOf(result).trim()) {
+    result.reply = antes.reply;
+    result.split = antes.split;
+    violations.push('travas_desfeitas_texto_vazio');
+    return;
+  }
+  // Tira bolhas que ficaram vazias depois do recorte.
+  if (Array.isArray(result.split)) {
+    result.split = result.split.filter(i => (typeof i === 'string' ? i.trim() : (i?.text || '').trim()));
+  }
+}
+
 // Extrai todos os textos da resposta (reply + split bubbles).
 function eachText(result, fn) {
   if (typeof result.reply === 'string' && result.reply) result.reply = fn(result.reply);
@@ -155,6 +219,9 @@ export function applyPolicyGuard(result, contact = {}) {
 
   // 2) FIXES cirúrgicos (mantêm a mensagem)
   eachText(result, t => applyFixesToText(t, violations));
+
+  // 2.5) TRAVAS DE CONTEXTO: não pedir o que o lead já deu, não se reapresentar.
+  aplicarTravasDeContexto(result, contact, violations);
 
   // 3) FLAGS (não alteram, só registram)
   const full = allTextOf(result);

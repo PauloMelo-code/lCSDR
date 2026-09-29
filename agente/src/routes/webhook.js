@@ -282,6 +282,19 @@ async function conversationAlreadyInAttendance(ghlContactId, windowMs) {
   }
 }
 
+// O lead já mandou ALGUM link? (invariante #12: divulgação exige link de vendas;
+// capa ou print de capas NÃO substitui). Olha as mensagens dele no histórico local.
+function leadJaMandouLink(contactId) {
+  try {
+    const r = db.prepare(`
+      SELECT 1 FROM messages
+      WHERE contact_id = ? AND direction = 'inbound' AND content LIKE '%http%'
+      LIMIT 1
+    `).get(contactId);
+    return Boolean(r);
+  } catch { return true; }   // falha ABERTO: nunca travar agendamento por erro de banco
+}
+
 // Minutos até checar se o agendamento REALMENTE fechou depois que o lead disse
 // "quero agendar". 0 desliga a checagem.
 const CHECAGEM_AGENDAMENTO_MIN = Number(process.env.AGENDAMENTO_CHECK_MIN ?? 15);
@@ -1125,6 +1138,38 @@ async function handleInbound(event) {
     }
 
     // 7) AGENDAMENTO, fase 3: o lead confirmou um horário → marca no GHL.
+    //
+    // ⚠️ DADOS OBRIGATÓRIOS ANTES DE FECHAR — até aqui isso era só regra de prompt,
+    // e o modelo furava. Duas exigências da LC que viraram trava:
+    //   • E-MAIL (regra 13/07): é pra onde vai o convite da reunião. O prompt já
+    //     mandava pedir antes, mas o código agendava mesmo sem.
+    //   • LINK DE VENDAS quando o funil é DIVULGAR (invariante #12): não dá pra
+    //     desenhar divulgação sem ver a obra publicada, e capa/print NÃO substitui
+    //     o link. Considera-se que o lead deu o link se ele mandou QUALQUER URL.
+    // Em vez de agendar errado, ela pede o que falta e agenda no próximo turno.
+    const emailConhecido = String(result.lead_email || fresh.email || '');
+    const temEmail = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailConhecido.trim());
+    // A exigência do link é a mais restritiva (pode adiar agendamento), então é
+    // desligável sem deploy: EXIGIR_LINK_DIVULGACAO=false.
+    const exigeLink = process.env.EXIGIR_LINK_DIVULGACAO !== 'false';
+    const funilDivulgar = (result.funnel || fresh.funnel) === 'divulgar';
+    const temLink = (funilDivulgar && exigeLink) ? leadJaMandouLink(fresh.id) : true;
+    if (result.book_slot && (!temEmail || !temLink)) {
+      const primeiro = (fresh.name || '').trim().split(/\s+/)[0];
+      const oi = primeiro && !/\d/.test(primeiro) ? `, ${primeiro}` : '';
+      const pedido = !temEmail
+        ? `Perfeito${oi}! Só preciso do seu melhor e-mail pra reservar e te mandar o convite da reunião 😊`
+        : `Perfeito${oi}! Antes de reservar, me manda o link de vendas do seu livro? É com ele que o especialista prepara a estratégia de divulgação 😊`;
+      logger.warn({ contactId: fresh.id, temEmail, temLink }, 'book_slot sem dado obrigatório — agendamento adiado, pedindo o que falta');
+      try {
+        db.prepare(`INSERT INTO events_log (contact_id, kind, payload) VALUES (?, 'agendamento_bloqueado_dado_faltante', ?)`)
+          .run(fresh.id, JSON.stringify({ temEmail, temLink }));
+      } catch {}
+      result.book_slot = null;          // não agenda neste turno
+      result.reply = '';
+      result.split = [pedido];
+    }
+
     let booked = null;
     if (schedulingEnabled() && result.book_slot) {
       // ANTI DOUBLE-BOOKING: se o lead JÁ tem reunião futura (um consultor
