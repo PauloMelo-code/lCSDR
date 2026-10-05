@@ -329,6 +329,18 @@ function marcarChecagemAgendamento(contactId) {
 // A PROCEDÊNCIA resolve: todo envio da Tina é registrado em tina_sent_msgs
 // (markTinaSent). Saída que NÃO está lá e não é automação = humano.
 function outboundEhHumano(msg) {
+  // ⚠️ ATIVIDADE DO SISTEMA NÃO É MENSAGEM DE NINGUÉM.
+  // O GHL registra eventos internos ("Opportunity created", mudança de stage) como
+  // TYPE_ACTIVITY_* com direction=outbound, source='app' e userId VAZIO. Sem este
+  // filtro eles caem no "não é da Tina nem automação → logo é humano" e o sistema
+  // conclui que um consultor está atendendo.
+  // ❌ CASO REAL (fim de semana 03-05/10): 28 leads de anúncio ficaram SEM RESPOSTA
+  // porque cada um tinha um "Opportunity created" na conversa — o portão de primeiro
+  // contato leu isso como atendimento humano e a Tina não assumiu nenhum.
+  // A lógica antiga (por userId) passava batido porque atividade não tem userId.
+  if (/^TYPE_ACTIVITY/i.test(String(msg?.messageType || ''))) return false;
+  if (!String(msg?.body ?? msg?.message ?? '').trim()) return false;   // sem texto: não é fala de humano
+
   const id = msg?.id || msg?.messageId || msg?._id;
   if (id && isTinaSentMessage(id)) return false;                 // foi a Tina
   const src = String(msg?.source || '').toLowerCase();
