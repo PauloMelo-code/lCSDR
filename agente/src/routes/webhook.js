@@ -1215,6 +1215,18 @@ async function handleInbound(event) {
       result.book_slot = null;          // não agenda neste turno
       result.reply = '';
       result.split = [pedido];
+      // ⚠️ E O STAGE VOLTA PRA 'agendando'. Sem esta linha o lead fica preso PARA
+      // SEMPRE: o modelo estava tentando agendar, então devolve stage 'agendado'.
+      // Com 'agendado' gravado, o turno seguinte (o que traz o dado que faltava)
+      // não busca mais a lista de horários — 'agendado' está fora da lista que
+      // dispara a busca E é excluído explicitamente do `pediuHorario`. Sem lista,
+      // o modelo não tem como agendar, e ninguém percebe porque o CRM diz
+      // "agendado" enquanto a agenda está vazia.
+      // ❌ CASO REAL (Alessandra, 13/10 16:57): escolheu 17h de quinta, deu o e-mail
+      // no minuto seguinte, e o compromisso nunca foi criado. No dia 14 ainda saiu
+      // lembrete de uma ligação que não existia. É a queixa nº 1 do doc da LC,
+      // com 13 ocorrências desde julho.
+      result.stage = 'agendando';
     }
 
     let booked = null;
