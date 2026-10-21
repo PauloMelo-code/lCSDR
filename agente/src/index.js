@@ -111,6 +111,11 @@ app.get('/health', (_, res) => {
         // Só o booleano: a URL não é segredo, mas poluiria o /health.
         imagemAgendamento: Boolean((process.env.GHL_IMAGEM_AGENDAMENTO_URL || '').trim()),
         followup: process.env.FOLLOWUP_ENABLED === 'true',
+        // Lembrete de compromisso pela Tina no WhatsApp (pedido Lilian 21/10). Convive
+        // com o e-mail do GHL de proposito: a Tina esbarra na janela de 24h e o e-mail
+        // e a rede de seguranca. Texto muda entre ligacao e reuniao.
+        lembrete: process.env.LEMBRETE_ENABLED === 'true',
+        lembreteAntesHoras: Number(process.env.LEMBRETE_ANTES_HORAS ?? 3),
         followupCloseHours: Number(process.env.FOLLOWUP_CLOSE_HOURS ?? 48),
         // A partir de quantos dias de intervalo o histórico ganha aviso de "outro
         // momento da conversa" (invariante #3). Serve também de marcador de build:
