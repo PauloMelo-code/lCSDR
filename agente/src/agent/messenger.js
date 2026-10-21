@@ -12,8 +12,15 @@ import { logger } from '../utils/logger.js';
 // Registra o messageId que a Tina acabou de enviar (procedência). No GHL a saída
 // carimba o userId do DONO do contato — igual ao do humano — então o único jeito
 // confiável de saber "isto foi a Tina" é guardar o id do envio. Idempotente/fail-open.
+//
+// ⚠️ VALE PROS DOIS CANAIS. A tabela guarda "ids de mensagem que NÓS enviamos",
+// não só do GHL (o nome da coluna é histórico). No uazapi a saída da Tina e a do
+// consultor chegam no webhook com o MESMO `fromMe: true` — sem este registro não
+// existe como separar uma da outra, e a trava de "humano assumiu" fica cega.
+// Por isso o ramo uazapi de sendText/sendMenu também passa por aqui.
 export function markTinaSent(res) {
-  const id = res?.messageId || res?.id || res?.message?.id || res?.messages?.[0]?.id;
+  const id = res?.messageId || res?.messageid || res?.id
+    || res?.key?.id || res?.message?.id || res?.messages?.[0]?.id;
   if (id) { try { db.prepare('INSERT OR IGNORE INTO tina_sent_msgs (ghl_message_id) VALUES (?)').run(String(id)); } catch {} }
   return res;
 }
@@ -56,7 +63,7 @@ export async function sendText(contact, text, opts = {}) {
   if (preferredChannel() === 'uazapi') {
     const number = normalizePhone(contact.phone);
     if (!number) throw new Error(`contato sem phone válido: ${contact.id}`);
-    return UAZAPI.sendText(number, text);
+    return markTinaSent(await UAZAPI.sendText(number, text));
   }
   return markTinaSent(await GHL.sendMessage({
     contactId: contact.ghl_contact_id,
@@ -74,7 +81,7 @@ export async function sendMenu(contact, { text, choices, footerText, type = 'but
   if (preferredChannel() === 'uazapi') {
     const number = normalizePhone(contact.phone);
     if (!number) throw new Error(`contato sem phone válido: ${contact.id}`);
-    return UAZAPI.sendMenu({ number, text, choices, footerText, type });
+    return markTinaSent(await UAZAPI.sendMenu({ number, text, choices, footerText, type }));
   }
   // Fallback GHL: vira texto formatado em lista numerada
   const lines = choices.map((c, i) => {
@@ -86,6 +93,27 @@ export async function sendMenu(contact, { text, choices, footerText, type = 'but
     contactId: contact.ghl_contact_id,
     message: fallbackText,
     type: ghlOutboundType(),
+  }));
+}
+
+/**
+ * Envia uma IMAGEM pro lead, com legenda opcional.
+ * ⚠️ Falha de imagem NÃO pode derrubar a confirmação de agendamento: se o anexo não
+ * for aceito, o lead já recebeu o horário e o compromisso está criado. Por isso quem
+ * chama trata o erro como não-fatal (sendSequence já faz isso).
+ */
+export async function sendImage(contact, url, legenda = '') {
+  if (!url) return null;
+  if (preferredChannel() === 'uazapi') {
+    const number = normalizePhone(contact.phone);
+    if (!number) throw new Error(`contato sem phone válido: ${contact.id}`);
+    return markTinaSent(await UAZAPI.sendMedia({ number, type: 'image', file: url, text: legenda }));
+  }
+  return markTinaSent(await GHL.sendMessage({
+    contactId: contact.ghl_contact_id,
+    message: legenda || '',
+    type: ghlOutboundType(),
+    attachments: [url],
   }));
 }
 
@@ -107,6 +135,11 @@ export async function sendSequence(contact, items) {
       let delivered = false;
       if (typeof item === 'string') {
         await sendText(contact, item);
+        delivered = true;
+      } else if (item.image) {
+        // Bolha de IMAGEM (regra LC 15/10: ao agendar com closer, mandar a imagem
+        // de orientação pro lead). Vai como anexo da mensagem; a legenda é opcional.
+        await sendImage(contact, item.image, item.text);
         delivered = true;
       } else if (item.buttons && item.buttons.length) {
         const choices = item.buttons.map(b => `${b.label}|${b.value || b.label}`);

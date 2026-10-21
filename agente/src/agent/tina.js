@@ -13,6 +13,7 @@ import { generateTinaReplyAnthropic } from './tina-anthropic.js';
 import { generateTinaReplyGemini } from './tina-gemini.js';
 import { applyPolicyGuard } from './policyGuard.js';
 import { expediente } from './scheduling.js';
+import { personaContext } from './persona.js';
 import { logger } from '../utils/logger.js';
 
 let warnedProvider = false;
@@ -163,6 +164,18 @@ export async function generateTinaReply({ contact, incomingText, extraContext = 
     const horaCtx = `AGORA em Brasília: ${agora}. ${expCtx}`;
     extraContext = extraContext ? `${horaCtx}\n\n${extraContext}` : horaCtx;
   } catch { /* sem hora no contexto, segue */ }
+
+  // IDENTIDADE POR DONO DO LEAD: entra aqui, na entrada única, pra valer nos 3 providers
+  // e também no canal uazapi e no follow-up do scheduler. Vem DEPOIS do bloco de hora e
+  // ANTES da lista de horários, e é o último a falar sobre identidade — o que vier do
+  // prompt estático sobre "Aqui é a Tina" fica sobrescrito por este bloco.
+  // Desligado por padrão (PERSONA_DONO_ENABLED): sem a chave, nada muda.
+  try {
+    const persona = personaContext(contact);
+    if (persona) extraContext = extraContext ? `${extraContext}\n\n${persona}` : persona;
+  } catch (err) {
+    logger.warn({ err: err.message, contactId: contact?.id }, 'falha montando persona do dono; segue como Tina');
+  }
 
   const primary = llmProvider();
   const secondary = pickSecondary(primary);

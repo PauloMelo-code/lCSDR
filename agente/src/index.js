@@ -107,6 +107,9 @@ app.get('/health', (_, res) => {
         preAtendimentoCals: (process.env.PREATENDIMENTO_CALENDAR_IDS || '').split(',').map(s => s.trim()).filter(Boolean).length,
         // Se setada, SOBRESCREVE o título por calendário (fica igual pra todo mundo).
         appointmentTitleFixo: process.env.GHL_APPOINTMENT_TITLE || null,
+        // Imagem de orientação anexada à confirmação de REUNIÃO com closer (LC 15/10).
+        // Só o booleano: a URL não é segredo, mas poluiria o /health.
+        imagemAgendamento: Boolean((process.env.GHL_IMAGEM_AGENDAMENTO_URL || '').trim()),
         followup: process.env.FOLLOWUP_ENABLED === 'true',
         followupCloseHours: Number(process.env.FOLLOWUP_CLOSE_HOURS ?? 48),
         // A partir de quantos dias de intervalo o histórico ganha aviso de "outro
@@ -133,12 +136,40 @@ app.get('/health', (_, res) => {
         requiredTag: process.env.GHL_TAG_REQUIRED ?? 'tina-liberada',
         // A Tina cede o turno quando um humano responde? Sem isto ela entra por cima
         // do consultor (caso 16/09). Estava fora do /health contra a regra do projeto.
+        // Vale nos DOIS canais: no GHL por lastOutboundWasHuman, no uazapi por
+        // cederTurnoSeHumano (saída com fromMe que não está em tina_sent_msgs).
         autoHumanDetection: process.env.AUTO_HUMAN_DETECTION_ENABLED === 'true',
+        // A Tina ATENDE lead pelo número uazapi? Default false: o canal do lead é
+        // o GHL/Meta e o uazapi só manda aviso no grupo. Com true, a Tina e o
+        // consultor passam a dividir o mesmo número — é quando a detecção de humano
+        // acima vira indispensável neste canal.
+        uazapiInbound: process.env.UAZAPI_INBOUND_ENABLED === 'true',
         skipLeadsInAttendance: process.env.SKIP_LEADS_IN_ATTENDANCE !== 'false',
         // ⚠️ o webhook lê TINA_ATTEND_EXCEPT_REENTRADA (com prefixo). Sem o prefixo
         // aqui, o /health reportava sempre false mesmo com o modo ligado.
         attendExceptReentrada: process.env.TINA_ATTEND_EXCEPT_REENTRADA === 'true',
         ownsEntryLane: process.env.TINA_OWNS_ENTRY_LANE === 'true',
+        // IDENTIDADE POR DONO (decisão Lilian 14/10): a IA assina com o nome do
+        // consultor dono do lead e oferece só a agenda dele. Desligado = atende como
+        // Tina, como sempre foi. É a chave de ligar/desligar vendida na proposta, então
+        // precisa dar pra conferir daqui se está no ar sem adivinhar.
+        personaPorDono: process.env.PERSONA_DONO_ENABLED === 'true',
+        // Quantos consultores estão aptos a emprestar o nome: ativos, vinculados ao
+        // usuário do GHL E com papel de quem atende lead. ⚠️ O filtro de papel tem que
+        // ser o MESMO de persona.js — admin não vira persona, então contar admin aqui
+        // faria o /health prometer mais consultores do que existe de verdade.
+        // Se vier 0 com personaPorDono=true, nenhum lead acha dono e tudo cai no
+        // comportamento antigo, silenciosamente.
+        personaConsultores: (() => {
+          try {
+            return db.prepare(`SELECT COUNT(*) c FROM sdr_users
+              WHERE active = 1 AND ghl_user_id IS NOT NULL
+                AND LOWER(COALESCE(role,'')) IN ('closer','sdr')`).get().c;
+          } catch { return null; }
+        })(),
+        // Frase usada quando o lead pergunta DIRETAMENTE se é IA. Texto é decisão da
+        // LC; o default não afirma ser pessoa.
+        personaRespostaIa: Boolean(process.env.PERSONA_RESPOSTA_IA),
       },
     });
   } catch (err) {

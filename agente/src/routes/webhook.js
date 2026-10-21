@@ -16,11 +16,12 @@ import {
 } from '../agent/handoff.js';
 import {
   schedulingEnabled, getNextSlots, slotsContextBlock, bookSlot, recordOffer,
-  upcomingAppointment, NO_SLOTS_CONTEXT, calendariosParaServico,
+  upcomingAppointment, NO_SLOTS_CONTEXT, calendariosParaServico, slotModality,
 } from '../agent/scheduling.js';
 import { bookSearchEnabled, searchBookLink } from '../agent/bookSearch.js';
 import { contactOppOutsideTinaLane, moveLeadToIaTina, claimToIaTina, resolvePipeline, contactInIaTinaLane, contactOppInReentrada, contactWorkedByOtherTeam, contactExclusivelyInTinaLane, closeSdrOppOnBooking, contactIsConvertedCustomer } from '../ghl/opportunities.js';
 import { liveHandoff } from '../agent/queue.js';
+import { sincronizarDonoDoLead, donoDoContato, personaEnabled } from '../agent/persona.js';
 import { notifyAgendamento, notifyLiveHandoff, notifyIaTinaForaJanela } from '../agent/notify.js';
 import { withContactLock } from '../utils/contactLock.js';
 import { attributionEnabled, enrichContactAttribution } from '../agent/attribution.js';
@@ -187,6 +188,11 @@ function extractTags(ghlContact) {
 // (handleOutbound), event-driven e sem esse risco. Ligar só se necessário:
 // AUTO_HUMAN_DETECTION_ENABLED=true (precisa link-ghl-users rodado).
 const AUTO_HUMAN_DETECTION = process.env.AUTO_HUMAN_DETECTION_ENABLED === 'true';
+
+// Imagem de orientação enviada ao lead ao agendar REUNIÃO com closer (regra LC 15/10).
+// Precisa ser URL pública (a biblioteca de mídia do GHL serve). Vazio = não envia nada,
+// e o fluxo fica idêntico ao de hoje. NÃO vale pra pré-atendimento, que é ligação.
+const IMAGEM_AGENDAMENTO_URL = (process.env.GHL_IMAGEM_AGENDAMENTO_URL || '').trim();
 
 // Filtro LEAD NOVO vs. JÁ EM ATENDIMENTO (pedido do Gabriel: o GHL não filtra
 // reentrada). Default ON. Só roda no PRIMEIRO contato (Tina nunca respondeu o
@@ -843,6 +849,13 @@ async function handleInbound(event) {
 
   const contact = upsertContactFromGHL(ghlContact);
 
+  // 1.5) DONO DO LEAD: grava quem é o consultor responsável, lendo o `assignedTo` que
+  // já veio no contato do GHL buscado lá em cima (custo zero, sem chamada extra).
+  // A partir daqui o resto do código só lê a linha local, inclusive o canal uazapi e
+  // o follow-up do scheduler, que não têm o contato do GHL em mãos.
+  // Reatribuição no GHL é acompanhada: a função só escreve quando o dono mudou.
+  sincronizarDonoDoLead(contact, ghlContact);
+
   // 1.5a) OUTRO TIME — DEFAULT ON (sempre, independente do modo/whitelist): a Tina
   // NUNCA assume lead que outro time está trabalhando — opp ABERTA em Reentrada OU
   // num pipeline diferente do dela (Closers/Editorial/Pré-Vendas 2.0...). Foi o
@@ -1104,9 +1117,31 @@ async function handleInbound(event) {
       // específicos do lead sem inventar. A Tina oferece os mais cedo por padrão.
       // Leitura crítica e curso NÃO vão pros closers — só Gabriel e Bruna (LC 25/09).
       // Usa o serviço já identificado no contato (ou o da última nota de qualificação).
-      const apenasCalendarios = calendariosParaServico(fresh.service_recommended || fresh.funnel_service || null);
+      let apenasCalendarios = calendariosParaServico(fresh.service_recommended || fresh.funnel_service || null);
       if (apenasCalendarios) logger.info({ contactId: fresh.id }, 'serviço de leitura crítica/curso — agenda restrita a Gabriel e Bruna');
-      const slots = await getNextSlots(8, { spread: true, apenasCalendarios });
+
+      // AGENDA DO DONO: assinando como o consultor, a Tina não pode oferecer o horário
+      // de outra pessoa — ela diria "consigo quinta às 10h" e a reunião cairia na agenda
+      // de um terceiro. Então restringe ao calendário do dono.
+      // ⚠️ ORDEM IMPORTA: a restrição por SERVIÇO (leitura crítica/curso só com Gabriel e
+      // Bruna, regra LC 25/09) é regra de negócio e GANHA do dono. Só restringe por dono
+      // quando o serviço não restringiu nada.
+      const donoDoLead = personaEnabled() ? donoDoContato(fresh) : null;
+      if (!apenasCalendarios && donoDoLead?.calendarId) {
+        apenasCalendarios = [donoDoLead.calendarId];
+      }
+
+      let slots = await getNextSlots(8, { spread: true, apenasCalendarios });
+
+      // Agenda do dono sem vaga nenhuma: volta pra lista completa em vez de dizer que
+      // não tem horário. Regra do Paulo (01/10): "caso não tenha horário disponível passa
+      // para o próximo mesmo já tendo recebido". Perder o lead por causa da agenda cheia
+      // de uma pessoa é pior do que ele falar com outro consultor.
+      if (!slots.length && donoDoLead?.calendarId && apenasCalendarios?.length === 1) {
+        logger.info({ contactId: fresh.id, dono: donoDoLead.nome },
+          'agenda do dono sem vaga — caindo pra lista completa');
+        slots = await getNextSlots(8, { spread: true, apenasCalendarios: null });
+      }
       if (slots.length) {
         extraContext = slotsContextBlock(slots);
         recordOffer(fresh.id, slots);  // guarda qual closer tem cada horário
@@ -1217,6 +1252,19 @@ async function handleInbound(event) {
         } else {
           items.push('Não consegui localizar pelo título aqui. Você pode me mandar o link de vendas do seu livro?');
         }
+      }
+    }
+
+    // 7.45) IMAGEM DE ORIENTAÇÃO NO AGENDAMENTO COM CLOSER (regra LC 15/10).
+    // Só entra quando a reunião FOI criada de fato (booked.ok) e quando é REUNIÃO de
+    // closer — pré-atendimento é ligação de 15 min do Gabriel/Bruna e não leva imagem.
+    // Fica como última bolha, depois da confirmação, pra não atropelar o texto.
+    // Sem a URL configurada, nada acontece: o fluxo segue igual ao de hoje.
+    if (booked?.ok && IMAGEM_AGENDAMENTO_URL) {
+      const mod = slotModality(booked.calendarId);
+      if (mod.tipo === 'reuniao') {
+        items.push({ image: IMAGEM_AGENDAMENTO_URL });
+        logger.info({ contactId: fresh.id }, 'imagem de orientação anexada à confirmação do agendamento');
       }
     }
 

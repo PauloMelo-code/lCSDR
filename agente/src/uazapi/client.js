@@ -97,6 +97,21 @@ export const UAZAPI = {
     return this.sendMenu({ ...opts, type: 'list' });
   },
 
+  /**
+   * Envia mídia (imagem, documento) com legenda opcional.
+   * Usado pela imagem de orientação que acompanha o agendamento com closer
+   * (regra LC 15/10).
+   *
+   * @param {object} opts
+   * @param {string} opts.number — E.164 sem +
+   * @param {string} opts.file — URL pública do arquivo
+   * @param {'image'|'document'|'video'} [opts.type='image']
+   * @param {string} [opts.text] — legenda
+   */
+  async sendMedia({ number, file, type = 'image', text = '' }) {
+    return uaz('POST', '/send/media', { number, type, file, text });
+  },
+
   /** Status da conexão da instância */
   async status() {
     return uaz('GET', '/instance/status');

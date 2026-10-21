@@ -6,9 +6,9 @@ import {
   recordInbound, recordOutbound, countMessagesToday,
 } from '../agent/contactService.js';
 import { generateTinaReply } from '../agent/tina.js';
-import { sendSequence, sendText } from '../agent/messenger.js';
+import { sendSequence, sendText, isTinaSentMessage } from '../agent/messenger.js';
 import {
-  pauseIA, scheduleFollowup,
+  pauseIA, scheduleFollowup, handleSDRReply,
   markQualifiedAndHandoff, markDisqualified, applyTinaTags,
 } from '../agent/handoff.js';
 import { withContactLock } from '../utils/contactLock.js';
@@ -108,18 +108,22 @@ router.post('/uazapi', async (req, res) => {
   }
 
   try {
-    // Ignora mensagens enviadas por mim mesmo
-    if (msg.fromMe === true || msg.wasSentByApi === true) {
-      logger.info({ id: msg.id }, 'webhook ignorado: fromMe ou wasSentByApi');
-      return;
-    }
-
     // Ignora mensagens de GRUPO. A Tina é 1:1 e NUNCA responde em grupo. O
     // número uazapi participa do grupo interno do time (avisos de agendamento/
     // handoff), então mensagens de grupo chegam aqui — não pode virar conversa.
+    // ⚠️ VEM ANTES do teste de `fromMe`: o que o time escreve no grupo também sai
+    // deste número, e sem esta ordem cairia na detecção de humano abaixo, que
+    // tentaria achar um contato pelo id do grupo.
     const chatId = String(msg.chatid || chat.wa_chatid || chat.id || '');
     if (chatId.includes('@g.us') || msg.isGroup === true || chat.isGroup === true) {
       logger.info({ chatId }, 'webhook uazapi: mensagem de GRUPO, ignorando (Tina é 1:1)');
+      return;
+    }
+
+    // Saiu DESTE número: não vira conversa de entrada. Mas antes de descartar,
+    // checa se foi um humano digitando — se foi, a Tina cede o turno.
+    if (msg.fromMe === true || msg.wasSentByApi === true) {
+      cederTurnoSeHumano(event, msg);
       return;
     }
 
@@ -173,6 +177,38 @@ function extractPhone(event) {
     if (digits && digits.length >= 10) return digits;
   }
   return null;
+}
+
+const AUTO_HUMAN_DETECTION = process.env.AUTO_HUMAN_DETECTION_ENABLED === 'true';
+
+// ⚠️ SAÍDA DO PRÓPRIO NÚMERO: FOI A TINA OU FOI O CONSULTOR? (invariante #8)
+// No uazapi tudo que sai deste número volta no webhook com `fromMe: true` — a
+// resposta da Tina e o que o consultor digita do celular dele chegam IGUAIS.
+// Antes os dois caíam no mesmo `if` de descarte, então o consultor podia assumir
+// a conversa e a Tina seguia respondendo por cima, sem nunca ficar sabendo: é o
+// caso do Gabriel (16/09), só que neste canal não existia trava nenhuma.
+// Hoje não dói porque o lead atende pelo GHL, mas o dia em que um consultor
+// dividir o número com a Tina (UAZAPI_INBOUND_ENABLED=true) é o dia em que isso
+// volta a acontecer.
+// A PROCEDÊNCIA resolve, igual ao canal GHL: todo envio nosso é registrado em
+// tina_sent_msgs (markTinaSent, inclusive no ramo uazapi). Saída que NÃO está lá
+// e não é automação = humano digitou → cede o turno.
+function cederTurnoSeHumano(event, msg) {
+  if (!AUTO_HUMAN_DETECTION) return false;
+  if (msg.wasSentByApi === true) return false;                      // automação, não é gente
+  if (isTinaSentMessage(msg.id)) return false;                      // foi a própria Tina
+  if (!String(msg.text ?? msg.content ?? '').trim()) return false;  // sem texto: não é fala de ninguém
+  const phone = extractPhone(event);
+  if (!phone) return false;
+  const contact = db.prepare(
+    'SELECT id, ai_paused FROM contacts WHERE phone = ? OR ghl_contact_id = ?'
+  ).get(phone, `wa-${phone}`);
+  // Sem contato = a Tina nunca entrou nessa conversa. Já pausado = nada a fazer.
+  if (!contact || contact.ai_paused) return false;
+  handleSDRReply(contact.id, null);
+  logger.info({ contactId: contact.id, messageId: msg.id },
+    'uazapi: humano respondeu por este número — Tina pausada');
+  return true;
 }
 
 // === Classificador de tipo de mensagem ===
@@ -525,3 +561,6 @@ async function handleInbound(event) {
 }
 
 export default router;
+
+// Exportado pra testes (scripts/test-turno-uazapi.mjs)
+export { cederTurnoSeHumano };
