@@ -29,6 +29,22 @@ export function lembreteHoras() {
   return Math.max(1, Number(process.env.LEMBRETE_ANTES_HORAS ?? 3));
 }
 
+// Quais tipos a Tina lembra. Default: OS DOIS (decisão Paulo 21/10).
+//
+// O workflow de lembretes do GHL é da LC, não nosso, e já manda 24h, 4h e 1h. Somando
+// o nosso, a autora recebe bastante toque — ❌ CASO REAL (Patricia Piza, 21/10): dois
+// e-mails de confirmação, lembrete de 24h, de 4h, o SMS de 1h e ainda o nosso.
+//
+// Mesmo assim o nosso cobre os dois tipos de propósito: ele é a parte que NÓS mantemos
+// e precisa ficar íntegra. Se o volume incomodar, quem apara é o workflow da LC, que é
+// deles pra mexer. Cortar o nosso seria depender de uma automação que não controlamos.
+//
+// Pra restringir mesmo assim: LEMBRETE_TIPOS=ligacao (só pré-atendimento).
+export function lembreteTipos() {
+  return (process.env.LEMBRETE_TIPOS || 'ligacao,reuniao')
+    .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+}
+
 // Largura da janela de varredura. O scheduler roda a cada TICK; a janela precisa ser
 // maior que o tick, senão um compromisso "passa entre dois ticks" e nunca é lembrado.
 const JANELA_MIN = Math.max(15, Number(process.env.LEMBRETE_JANELA_MIN ?? 45));
@@ -95,10 +111,12 @@ export async function processarLembretes() {
       if (st && !['confirmed', 'booked', 'new', 'showed'].includes(st)) continue;
       if (jaLembrado(apptId)) continue;
 
+      const mod = slotModality(calendarId);
+      // Tipo fora da lista configurada: quem lembra é o GHL, a Tina não duplica.
+      if (!lembreteTipos().includes(mod.tipo)) continue;
+
       const contact = db.prepare('SELECT * FROM contacts WHERE ghl_contact_id = ?').get(ghlContactId);
       if (!contact) continue;   // lead que a Tina nunca atendeu: não é dela pra lembrar
-
-      const mod = slotModality(calendarId);
       const texto = textoLembrete({
         nome: (contact.name || '').trim().split(/\s+/)[0],
         consultor: calendarName(calendarId),

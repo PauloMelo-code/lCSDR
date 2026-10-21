@@ -9,7 +9,7 @@
 // Uso: node scripts/test-lembrete.mjs
 
 import assert from 'node:assert/strict';
-import { textoLembrete } from '../src/agent/lembrete.js';
+import { textoLembrete, lembreteTipos } from '../src/agent/lembrete.js';
 
 let ok = 0;
 const caso = (nome, fn) => { fn(); console.log(`  ✓ ${nome}`); ok++; };
@@ -56,6 +56,22 @@ try {
     const t = textoLembrete({ nome: 'Ana', consultor: null, quando: 'hoje às 16:00', tipo: 'reuniao' });
     assert.doesNotMatch(t, /\scom\s+(null|undefined)/, 'vazou null na mensagem do lead');
     assert.match(t, /reuni[ãa]o hoje às 16:00/);
+  });
+
+  caso('por padrão a Tina lembra os DOIS tipos', () => {
+    // Decisão Paulo 21/10: o nosso cobre tudo e fica íntegro. Se o volume incomodar,
+    // quem apara é o workflow da LC, que é deles. Cortar o nosso seria passar a
+    // depender de uma automação que não controlamos.
+    delete process.env.LEMBRETE_TIPOS;
+    const t = lembreteTipos();
+    assert.ok(t.includes('ligacao'), 'pré-atendimento ficou de fora');
+    assert.ok(t.includes('reuniao'), 'reunião ficou de fora');
+  });
+
+  caso('dá pra restringir sem deploy', () => {
+    process.env.LEMBRETE_TIPOS = 'ligacao';
+    assert.deepEqual(lembreteTipos(), ['ligacao']);
+    delete process.env.LEMBRETE_TIPOS;
   });
 
   console.log(`\n${ok} casos passaram\n`);

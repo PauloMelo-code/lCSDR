@@ -5,7 +5,7 @@ import { recordOutbound } from './agent/contactService.js';
 import { markTinaSent } from './agent/messenger.js';
 import { sendResumoDiaGroup, notifyAgendamentoTravado } from './agent/notify.js';
 import { sweepOrganico } from './agent/organicoSweep.js';
-import { processarLembretes, lembreteEnabled, lembreteHoras } from './agent/lembrete.js';
+import { processarLembretes, lembreteEnabled, lembreteHoras, lembreteTipos } from './agent/lembrete.js';
 import { upcomingAppointment } from './agent/scheduling.js';
 import { contactWorkedByOtherTeam } from './ghl/opportunities.js';
 import { handleOpportunityStage } from './routes/webhook.js';
@@ -238,7 +238,7 @@ export function startScheduler() {
     tick_ms: TICK_MS,
     resumoDia: resumoOn ? (resumoConfigOk ? `ligado (${process.env.RESUMO_DIA_HORA || 18}h BRT)` : 'ligado mas sem grupo/token') : 'desligado',
     varreduraOrganico: SWEEP_ON ? `ligada (${SWEEP_INTERVAL_MS / 60000}min, máx ${SWEEP_MAX})` : 'desligada',
-    lembretes: lembreteEnabled() ? `ligados (${lembreteHoras()}h antes)` : 'desligados',
+    lembretes: lembreteEnabled() ? `ligados (${lembreteHoras()}h antes, tipos: ${lembreteTipos().join('+')})` : 'desligados',
   }, 'scheduler iniciado');
   setInterval(() => {
     processFollowups().catch(err => logger.error(err));
