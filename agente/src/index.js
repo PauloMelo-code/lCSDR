@@ -1,4 +1,7 @@
 import 'dotenv/config';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
@@ -83,6 +86,23 @@ app.use('/auth/login', loginLimiter);
 app.use('/webhook', webhookLimiter);
 app.use('/api', apiLimiter);
 
+// Momento em que ESTE processo subiu. É a forma confiável de saber se um deploy
+// realmente pegou: deploy reinicia o container, então startedAt recente = build novo.
+// ⚠️ Existe porque "conferir no /health" só funcionava quando o commit por acaso
+// trazia uma flag nova. Commit que mexe em lógica (uma trava, uma correção) não deixa
+// rastro, e a gente ficava sem saber se o container ainda rodava a imagem velha —
+// aconteceu duas vezes, com o historyGapDays e com as travas de agendamento 29/10.
+const STARTED_AT = new Date().toISOString();
+
+// Versão do package.json. Lida com tolerância: se o arquivo não vier na imagem, o
+// /health continua respondendo — um health check não pode cair por causa de metadado.
+const pkgVersion = (() => {
+  try {
+    const p = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../package.json');
+    return JSON.parse(fs.readFileSync(p, 'utf8')).version || null;
+  } catch { return null; }
+})();
+
 // Health check real: testa conexão com DB.
 // EasyPanel/UptimeRobot batem nesse endpoint pra detectar zumbi.
 app.get('/health', (_, res) => {
@@ -94,6 +114,11 @@ app.get('/health', (_, res) => {
     res.json({
       ok: true,
       ts: new Date().toISOString(),
+      // Quando o processo subiu e há quanto tempo roda. `upMin` pequeno logo depois
+      // de um deploy = o build novo entrou. Grande = o container é o antigo.
+      startedAt: STARTED_AT,
+      upMin: Math.round((Date.now() - Date.parse(STARTED_AT)) / 60_000),
+      version: pkgVersion,
       cfg: {
         attribution: process.env.ATTRIBUTION_SYNC_ENABLED === 'true',
         metaToken: Boolean(process.env.META_ADS_TOKEN),
