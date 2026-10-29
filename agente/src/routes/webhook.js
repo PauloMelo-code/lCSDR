@@ -16,7 +16,7 @@ import {
 } from '../agent/handoff.js';
 import {
   schedulingEnabled, getNextSlots, slotsContextBlock, bookSlot, recordOffer,
-  upcomingAppointment, NO_SLOTS_CONTEXT, calendariosParaServico, slotModality,
+  upcomingAppointment, NO_SLOTS_CONTEXT, calendariosParaServico, slotModality, expediente,
 } from '../agent/scheduling.js';
 import { bookSearchEnabled, searchBookLink } from '../agent/bookSearch.js';
 import { contactOppOutsideTinaLane, moveLeadToIaTina, claimToIaTina, resolvePipeline, contactInIaTinaLane, contactOppInReentrada, contactWorkedByOtherTeam, contactExclusivelyInTinaLane, closeSdrOppOnBooking, contactIsConvertedCustomer } from '../ghl/opportunities.js';
@@ -1326,6 +1326,53 @@ async function handleInbound(event) {
         } catch {}
         // O time PRECISA saber: o lead ficou esperando um horário que não existe.
         await notifyIaTinaForaJanela(fresh).catch(() => {});
+      }
+    }
+
+    // 7.7) TRAVA DE HORÁRIO NO "FALAR AGORA" (queixa do Gabriel, 29/10).
+    // No modo pré-atendimento o prompt manda descrever até o "falar agora" como
+    // "pré-atendimento de 15 min por telefone". Só que `handoff_mode: agora` chama o
+    // liveHandoff, que NÃO cria compromisso: passa o lead pro próximo da fila. Então
+    // ela usa linguagem de agendamento num fluxo que não agenda.
+    // ❌ CASO REAL (Marcos, 29/10): "é uma ligação telefônica de 15 minutos... posso
+    // confirmar pra hoje às 10:30?" — zero compromissos na agenda. O Gabriel reportou
+    // como "agendou e não colocou na agenda", e estava certo.
+    // ⚠️ A trava 7.6 acima NÃO pega este caso: ela procura AFIRMAÇÃO ("agendei"), e
+    // "posso confirmar pra hoje às 10:30?" é PERGUNTA. Horário prometido em pergunta
+    // vale tanto quanto em afirmação pro lead que está lendo.
+    // Regra do Gabriel, virada código: se fala horário, tem que ir pra agenda.
+    const HORA_COMPROMETIDA = /(?:^|[^\d])(?:às\s*)?\d{1,2}\s*(?:h\b|h\d{2}|:\d{2})/i;
+    const COMPROMETE = /\b(confirmar|confirmo|confirma|fica(mos)?\s+(pra|para)|te ligo|vai te ligar|liga(r)?\s+(pra|para)\s+voc[êe]|encaixar|reserv)/i;
+    if (result.handoff_mode === 'agora' && !booked?.ok) {
+      const idx = items.map(x => (typeof x === 'string' ? x : x?.text || ''))
+        .findLastIndex(t => HORA_COMPROMETIDA.test(t) && COMPROMETE.test(t));
+      if (idx >= 0) {
+        const primeiro = (fresh.name || '').trim().split(/\s+/)[0];
+        const oi = primeiro && !/\d/.test(primeiro) ? `, ${primeiro}` : '';
+        const exp = expediente();
+        items[idx] = exp.aberto
+          ? `Perfeito${oi}! Já estou te conectando com o próximo especialista disponível 😊 Ele assume aqui com você em instantes.`
+          : `Perfeito${oi}! Nosso time atende ${exp.faixa}, seg-sex — já deixei seu contato com eles e uma pessoa te chama por aqui ${exp.proxima} 😊`;
+        logger.warn({ contactId: fresh.id, textoRemovido: String(items[idx]).slice(0, 120) },
+          'HORÁRIO PROMETIDO NO FALAR AGORA: o liveHandoff não cria compromisso — texto corrigido');
+        try {
+          db.prepare(`INSERT INTO events_log (contact_id, kind, payload) VALUES (?, 'horario_no_falar_agora', ?)`)
+            .run(fresh.id, JSON.stringify({ modo: 'agora' }));
+        } catch {}
+      }
+    }
+
+    // 7.8) REDE: horário prometido SEM reunião criada agenda a checagem, em qualquer
+    // fluxo. Antes o `marcarChecagemAgendamento` só rodava no `handoff_mode: agendar`,
+    // então o caso do Marcos (que terminou em `agora`) nunca foi checado e o horário
+    // passou em silêncio. Se alguma redação escapar das travas acima, pelo menos o
+    // time é avisado em AGENDAMENTO_CHECK_MIN minutos.
+    if (!booked?.ok) {
+      const prometeu = items.map(x => (typeof x === 'string' ? x : x?.text || ''))
+        .some(t => HORA_COMPROMETIDA.test(t) && (COMPROMETE.test(t) || AFIRMA_AGENDOU.test(t)));
+      if (prometeu) {
+        logger.warn({ contactId: fresh.id }, 'horário prometido sem reunião criada — checagem agendada');
+        marcarChecagemAgendamento(fresh.id);
       }
     }
 
