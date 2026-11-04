@@ -126,6 +126,33 @@ export async function notifyAgendamentoTravado(contact, { desde } = {}) {
   await notifyContactGHL(msg);
 }
 
+// A trava de dado obrigatório desistiu de pedir e passou pro time (webhook.js,
+// passo 7): o lead escolheu horário mas não deu o e-mail depois de pedido, ou o
+// livro ainda não está à venda (divulgação sem link não agenda). A Tina pausa e
+// NÃO marca — alguém do time decide com o lead.
+export async function notifyAgendamentoPrecisaTime(contact, { falta, semObra, slotLabel } = {}) {
+  try {
+    db.prepare(`INSERT INTO events_log (contact_id, kind, payload) VALUES (?, 'agendamento_escalado_time', ?)`)
+      .run(contact.id, JSON.stringify({ falta, semObra: Boolean(semObra) }));
+  } catch (err) {
+    logger.error({ err: err.message, contactId: contact.id }, 'falha ao registrar agendamento_escalado_time');
+  }
+  const nome = contact.name || 'Lead';
+  const tel = contact.phone || '';
+  const motivo = semObra
+    ? 'pela conversa, o livro ainda não foi publicado, então não tem link de vendas (divulgação não agenda sem link)'
+    : falta === 'email'
+      ? 'a Tina pediu o e-mail, o lead respondeu e não veio um e-mail válido'
+      : 'a Tina pediu o link de vendas, o lead respondeu e não veio o link';
+  const msg = `🙋 *Agendamento precisa do time*\n`
+    + `👤 ${nome}${tel ? ` (${tel})` : ''}\n`
+    + (slotLabel ? `🗓️ Horário que ele escolheu: ${slotLabel}\n` : '')
+    + `Motivo: ${motivo}.\n`
+    + `👉 A Tina NÃO marcou e parou de responder esse lead. Alguém do time precisa falar com ele e decidir o agendamento.`;
+  await notifyGroupUazapi(msg);
+  await notifyContactGHL(msg);
+}
+
 export async function notifyIaTinaForaJanela(contact) {
   try {
     db.prepare(`INSERT INTO events_log (contact_id, kind, payload) VALUES (?, 'ia_tina_fora_janela', ?)`)

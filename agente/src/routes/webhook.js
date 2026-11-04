@@ -16,13 +16,14 @@ import {
 } from '../agent/handoff.js';
 import {
   schedulingEnabled, getNextSlots, slotsContextBlock, bookSlot, recordOffer,
-  upcomingAppointment, NO_SLOTS_CONTEXT, calendariosParaServico, slotModality, expediente,
+  upcomingAppointment, NO_SLOTS_CONTEXT, calendariosParaServico, slotModality, expediente, labelForSlot,
 } from '../agent/scheduling.js';
 import { bookSearchEnabled, searchBookLink } from '../agent/bookSearch.js';
 import { contactOppOutsideTinaLane, moveLeadToIaTina, claimToIaTina, resolvePipeline, contactInIaTinaLane, contactOppInReentrada, contactWorkedByOtherTeam, contactExclusivelyInTinaLane, closeSdrOppOnBooking, contactIsConvertedCustomer } from '../ghl/opportunities.js';
 import { liveHandoff } from '../agent/queue.js';
 import { sincronizarDonoDoLead, donoDoContato, personaEnabled } from '../agent/persona.js';
-import { notifyAgendamento, notifyLiveHandoff, notifyIaTinaForaJanela } from '../agent/notify.js';
+import { notifyAgendamento, notifyLiveHandoff, notifyIaTinaForaJanela, notifyAgendamentoPrecisaTime } from '../agent/notify.js';
+import { decidirDadoFaltante, mensagemEscalada, emailNasMensagens } from '../agent/dadoObrigatorio.js';
 import { withContactLock } from '../utils/contactLock.js';
 import { attributionEnabled, enrichContactAttribution } from '../agent/attribution.js';
 
@@ -290,15 +291,51 @@ async function conversationAlreadyInAttendance(ghlContactId, windowMs) {
 
 // O lead já mandou ALGUM link? (invariante #12: divulgação exige link de vendas;
 // capa ou print de capas NÃO substitui). Olha as mensagens dele no histórico local.
+// Também vale link sem "http" (www., amazon, a.co). Só conta o que o lead DIGITOU:
+// o marcador interno do PDF ("[lead enviou arquivo: https://…]") tem URL e liberava
+// divulgação pra quem mandou o manuscrito — justo quem ainda não publicou. O link
+// achado pelo search_book também não conta: o lead pode ter respondido "não é esse".
 function leadJaMandouLink(contactId) {
   try {
     const r = db.prepare(`
       SELECT 1 FROM messages
-      WHERE contact_id = ? AND direction = 'inbound' AND content LIKE '%http%'
+      WHERE contact_id = ? AND direction = 'inbound'
+        AND COALESCE(content_type, 'text') = 'text' AND content NOT LIKE '[%'
+        AND (content LIKE '%http%' OR content LIKE '%www.%' OR content LIKE '%amazon.com%' OR content LIKE '%a.co/%')
       LIMIT 1
     `).get(contactId);
     return Boolean(r);
   } catch { return true; }   // falha ABERTO: nunca travar agendamento por erro de banco
+}
+
+// Pedidos de dado obrigatório que a trava já fez nas últimas 24h (payload de cada um).
+function pedidosDadoFaltante(contactId) {
+  try {
+    return db.prepare(`
+      SELECT payload FROM events_log
+      WHERE contact_id = ? AND kind = 'agendamento_bloqueado_dado_faltante'
+        AND created_at >= datetime('now', '-1 day')
+    `).all(contactId).map(r => { try { return JSON.parse(r.payload); } catch { return {}; } });
+  } catch { return []; }      // falha = "nunca pediu": volta ao comportamento antigo (pede)
+}
+
+// id da mensagem mais nova do lead. Gravado junto com o pedido: o pedido só conta
+// como "já pedi e não veio" se o lead mandou algo DEPOIS dele (rajada não conta).
+function ultimoInboundId(contactId) {
+  try {
+    return db.prepare(`SELECT MAX(id) AS id FROM messages WHERE contact_id = ? AND direction = 'inbound'`).get(contactId)?.id ?? null;
+  } catch { return null; }
+}
+
+// Mensagens MAIS RECENTES do lead (invariante #1), só da última semana (#3).
+function textosRecentesDoLead(contactId) {
+  try {
+    return db.prepare(`
+      SELECT content FROM messages
+      WHERE contact_id = ? AND direction = 'inbound' AND created_at >= datetime('now', '-7 days')
+      ORDER BY id DESC LIMIT 15
+    `).all(contactId).map(r => r.content || '');
+  } catch { return []; }
 }
 
 // Minutos até checar se o agendamento REALMENTE fechou depois que o lead disse
@@ -317,7 +354,9 @@ function marcarChecagemAgendamento(contactId) {
   if (!(CHECAGEM_AGENDAMENTO_MIN > 0)) return;
   try {
     db.prepare(`INSERT INTO followups (contact_id, due_at, reason) VALUES (?, ?, 'agendamento_travado')`)
-      .run(contactId, new Date(Date.now() + CHECAGEM_AGENDAMENTO_MIN * 60_000).toISOString());
+      // Formato do datetime('now') do SQLite: com o ISO ("…T…Z") a comparação de texto
+      // do scheduler só vencia na virada do dia UTC (21h BRT), não em 15 min.
+      .run(contactId, new Date(Date.now() + CHECAGEM_AGENDAMENTO_MIN * 60_000).toISOString().slice(0, 19).replace('T', ' '));
   } catch (err) {
     logger.warn({ err: err.message, contactId }, 'falha agendando checagem de agendamento travado');
   }
@@ -1173,9 +1212,15 @@ async function handleInbound(event) {
     }
 
     // 6.9) E-MAIL DO LEAD (regra LC 16/07: sempre pedir e-mail antes de agendar).
-    // A Tina extrai em result.lead_email; aqui salva no GHL + local. Fail-open.
-    if (result.lead_email && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(result.lead_email).trim())) {
-      const mail = String(result.lead_email).trim().toLowerCase();
+    // Salva no GHL + local. Fail-open.
+    // ⚠️ result.lead_email NUNCA vem: o prompt pede o campo, mas ele não está no schema
+    // de resposta (tina-openai.js / tina-gemini.js), e o schema strict descarta. Então
+    // o e-mail que o lead DIGITA era ignorado e a trava do passo 7 pedia de novo. O
+    // código lê das mensagens do lead (sem completar nada) — revisão de 03/11.
+    // Só quando o contato ainda não tem e-mail: nunca sobrescreve o do GHL.
+    const emailDigitado = result.lead_email || (fresh.email ? null : emailNasMensagens(textosRecentesDoLead(fresh.id)));
+    if (emailDigitado && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(emailDigitado).trim())) {
+      const mail = String(emailDigitado).trim().toLowerCase();
       if (mail !== (fresh.email || '').toLowerCase()) {
         GHL.updateContact(ghlContactId, { email: mail }).catch(err =>
           logger.warn({ err: err.message, contactId: fresh.id }, 'falha salvando lead_email no GHL'));
@@ -1194,25 +1239,68 @@ async function handleInbound(event) {
     //     desenhar divulgação sem ver a obra publicada, e capa/print NÃO substitui
     //     o link. Considera-se que o lead deu o link se ele mandou QUALQUER URL.
     // Em vez de agendar errado, ela pede o que falta e agenda no próximo turno.
-    const emailConhecido = String(result.lead_email || fresh.email || '');
+    // Pede UMA vez: na segunda, ou se o livro ainda não está à venda, passa pro time
+    // (regra em agent/dadoObrigatorio.js, casos Katiane e Deividi de 03/11).
+    const emailConhecido = String(emailDigitado || fresh.email || '');
     const temEmail = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailConhecido.trim());
     // A exigência do link é a mais restritiva (pode adiar agendamento), então é
     // desligável sem deploy: EXIGIR_LINK_DIVULGACAO=false.
     const exigeLink = process.env.EXIGIR_LINK_DIVULGACAO !== 'false';
     const funilDivulgar = (result.funnel || fresh.funnel) === 'divulgar';
     const temLink = (funilDivulgar && exigeLink) ? leadJaMandouLink(fresh.id) : true;
-    if (result.book_slot && (!temEmail || !temLink)) {
+    let faltante = result.book_slot
+      ? decidirDadoFaltante({
+        temEmail, temLink,
+        pedidos: pedidosDadoFaltante(fresh.id),
+        enviadoEm: Date.parse(event.dateAdded || event.date_added || '') || null,
+        ultimoInbound: ultimoInboundId(fresh.id),
+        textoAtual: content,
+        textosLead: temLink ? [] : textosRecentesDoLead(fresh.id),
+      })
+      : null;
+    // Lead que JÁ tem reunião futura não passa pela trava: cai no anti double-booking
+    // abaixo ("você já tem um horário reservado"), e não num pedido de e-mail ou num
+    // "o time vai fechar esse horário". A consulta é reaproveitada lá embaixo.
+    let reuniaoFutura;   // undefined = ainda não consultada
+    if (faltante && schedulingEnabled()) {
+      reuniaoFutura = await upcomingAppointment(fresh);
+      if (reuniaoFutura) faltante = null;
+    }
+    // AINDA NÃO RESPONDEU: o lead mandou a mensagem antes de ver o pedido (rajada, ou
+    // áudio transcrito depois) ou disse "só um minutinho". Nem repete o pedido (seria
+    // a mensagem duplicada) nem escala (ele vai responder). Este turno fica mudo: o
+    // pedido já é a resposta. Se ele não voltar, a checagem de agendamento travado
+    // avisa o time em AGENDAMENTO_CHECK_MIN.
+    if (faltante?.aguardar) {
+      logger.info({ contactId: fresh.id, falta: faltante.falta }, 'pedido de dado obrigatório ainda sem resposta do lead — turno sem envio');
+      marcarChecagemAgendamento(fresh.id);
+      return;
+    }
+    let escalarTime = null;   // preenchido → passo 11 pausa a Tina e avisa o time
+    let pedidoFeito = null;   // preenchido → o pedido é registrado DEPOIS de enviado (passo 8)
+    if (faltante?.escalar) {
+      escalarTime = {
+        falta: faltante.falta,
+        semObra: faltante.semObra,
+        slotLabel: Number.isNaN(Date.parse(result.book_slot)) ? null : labelForSlot(result.book_slot),
+      };
+      logger.warn({ contactId: fresh.id, falta: faltante.falta, semObra: faltante.semObra },
+        'book_slot sem dado obrigatório pela 2ª vez (ou livro não publicado) — não agenda, passa pro time');
+      result.book_slot = null;
+      result.reply = '';
+      result.split = [mensagemEscalada({ nome: fresh.name, semObra: faltante.semObra, exp: expediente() })];
+      result.search_book = null;   // sem bolha extra pedindo link
+      result.stage = 'qualificado';
+    } else if (faltante) {
       const primeiro = (fresh.name || '').trim().split(/\s+/)[0];
       const oi = primeiro && !/\d/.test(primeiro) ? `, ${primeiro}` : '';
-      const pedido = !temEmail
+      const pedido = faltante.falta === 'email'
         ? `Perfeito${oi}! Só preciso do seu melhor e-mail pra reservar e te mandar o convite da reunião 😊`
         : `Perfeito${oi}! Antes de reservar, me manda o link de vendas do seu livro? É com ele que o especialista prepara a estratégia de divulgação 😊`;
       logger.warn({ contactId: fresh.id, temEmail, temLink }, 'book_slot sem dado obrigatório — agendamento adiado, pedindo o que falta');
-      try {
-        db.prepare(`INSERT INTO events_log (contact_id, kind, payload) VALUES (?, 'agendamento_bloqueado_dado_faltante', ?)`)
-          .run(fresh.id, JSON.stringify({ temEmail, temLink }));
-      } catch {}
+      pedidoFeito = { temEmail, temLink, falta: faltante.falta };
       result.book_slot = null;          // não agenda neste turno
+      result.search_book = null;        // uma pergunta por vez (invariante #4)
       result.reply = '';
       result.split = [pedido];
       // ⚠️ E O STAGE VOLTA PRA 'agendando'. Sem esta linha o lead fica preso PARA
@@ -1233,7 +1321,7 @@ async function handleInbound(event) {
     if (schedulingEnabled() && result.book_slot) {
       // ANTI DOUBLE-BOOKING: se o lead JÁ tem reunião futura (um consultor
       // marcou manualmente, ou a própria Tina já marcou antes), NÃO cria outra.
-      const existing = await upcomingAppointment(fresh);
+      const existing = reuniaoFutura !== undefined ? reuniaoFutura : await upcomingAppointment(fresh);
       if (existing) {
         logger.warn({ contactId: fresh.id, existingStart: existing.startTime, existingId: existing.id }, 'lead já tem reunião futura — evitando double-booking');
         booked = { ok: false, alreadyBooked: true, existing };
@@ -1403,6 +1491,14 @@ async function handleInbound(event) {
       const txt = typeof item === 'string' ? item : (item?.text || '');
       if (txt) recordOutbound(fresh.id, { author: 'ia', content: txt, usage: result.usage });
     }
+    // Pedido de dado obrigatório só conta como "pedido" depois que SAIU: se o envio
+    // falhasse, o turno seguinte escalaria sem o lead nunca ter visto o pedido.
+    if (pedidoFeito) {
+      try {
+        db.prepare(`INSERT INTO events_log (contact_id, kind, payload) VALUES (?, 'agendamento_bloqueado_dado_faltante', ?)`)
+          .run(fresh.id, JSON.stringify({ ...pedidoFeito, askedAt: new Date().toISOString(), ultimoInbound: ultimoInboundId(fresh.id) }));
+      } catch {}
+    }
 
     // 9) Atualiza estado do contato
     // service_recommended é gravado pra durar entre os turnos: os horários são
@@ -1442,7 +1538,22 @@ async function handleInbound(event) {
     // 11) Roteamento final
     const SCHED = schedulingEnabled();
 
-    if (booked && booked.alreadyBooked) {
+    if (escalarTime) {
+      // TRAVA DE DADO OBRIGATÓRIO DESISTIU (passo 7): não marcou, não pede de novo.
+      // Qualifica, pausa e avisa o time. O card fica ABERTO de propósito: não houve
+      // agendamento (invariante #9 fecha o card só quando a reunião existe), e é
+      // nele que o time trabalha. Os follow-ups saem, senão o aviso de "agendamento
+      // não concluído" chega duplicado daqui a AGENDAMENTO_CHECK_MIN.
+      await markQualifiedAndHandoff(fresh, result, { pause: true }).catch(err =>
+        logger.error({ err: err.message }, 'markQualifiedAndHandoff (escalada) falhou'));
+      // Termina em 'qualificado' (o pauseIA acima deixa 'handoff'). Com 'handoff' o
+      // maybeReclaimLead devolve o lead pra Tina na próxima mensagem dele, ela tenta
+      // agendar de novo e a trava repete a mesma mensagem — o loop que este ramo fecha.
+      db.prepare(`UPDATE contacts SET stage = 'qualificado', ai_paused = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?`).run(fresh.id);
+      db.prepare('UPDATE followups SET sent = 1 WHERE contact_id = ? AND sent = 0').run(fresh.id);
+      await notifyAgendamentoPrecisaTime(fresh, escalarTime).catch(() => {});
+
+    } else if (booked && booked.alreadyBooked) {
       // Lead JÁ tinha reunião futura (consultor marcou, ou a Tina já marcou).
       // Não duplica: pausa, marca como agendado, registra. NÃO notifica de novo.
       db.prepare(`
