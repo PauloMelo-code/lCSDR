@@ -6,7 +6,7 @@ import { markTinaSent } from './agent/messenger.js';
 import { sendResumoDiaGroup, notifyAgendamentoTravado } from './agent/notify.js';
 import { sweepOrganico } from './agent/organicoSweep.js';
 import { processarLembretes, lembreteEnabled, lembreteHoras, lembreteTipos } from './agent/lembrete.js';
-import { upcomingAppointment } from './agent/scheduling.js';
+import { upcomingAppointment, expediente } from './agent/scheduling.js';
 import { contactWorkedByOtherTeam } from './ghl/opportunities.js';
 import { handleOpportunityStage } from './routes/webhook.js';
 import { logger } from './utils/logger.js';
@@ -18,28 +18,104 @@ const TICK_MS = 60_000; // 1 min
 // ~600 cards acumulados). 0 desliga o encerramento automático.
 const CLOSE_HOURS = Number(process.env.FOLLOWUP_CLOSE_HOURS ?? 48);
 
+// Motivos que NÃO mandam mensagem pro lead (aviso pro time, encerrar card): rodam a
+// qualquer hora. Os demais são mensagem pro lead e só saem no horário comercial.
+export const SEM_MENSAGEM_PRO_LEAD = ['agendamento_travado', 'encerrar_sem_resposta'];
+
+// Follow-ups vencidos, 1 por contato (o mais antigo). Parâmetros: aberto (1/0) e os
+// SEM_MENSAGEM_PRO_LEAD. Exportado pro teste (scripts/test-followup-horario.mjs).
+// ⚠️ datetime(f.due_at): due_at é gravado em ISO ("…T…Z") e, comparado como TEXTO
+// com datetime('now') ("YYYY-MM-DD HH:MM:SS"), o "T" ganha do espaço — o follow-up
+// só vencia na virada do dia UTC (21h BRT), qualquer que fosse o prazo (03/11).
+export const SQL_FOLLOWUPS_VENCIDOS = `
+  SELECT f.*, c.id as contact_id, c.ghl_contact_id, c.name, c.phone, c.ai_paused, c.stage, c.last_inbound_at, c.funnel
+  FROM followups f
+  JOIN contacts c ON c.id = f.contact_id
+  WHERE f.sent = 0 AND datetime(f.due_at) <= datetime('now')
+    AND (? = 1 OR f.reason IN (${SEM_MENSAGEM_PRO_LEAD.map(() => '?').join(', ')}))
+    AND f.id = (
+      SELECT MIN(id) FROM followups
+      WHERE contact_id = f.contact_id AND sent = 0
+    )
+  LIMIT 20
+`;
+
+// Reserva a linha ANTES de processar: marca sent primeiro, então um erro depois não
+// dispara duplicado. É pela LINHA, não pelo contato: se outro tick (mais lento que
+// TICK_MS, esperando o GHL) já a pegou, ou se o lead falou nesse meio-tempo
+// (recordInbound cancelou), devolve false — mesmo que o contato já tenha linhas
+// novas, que um SELECT velho não pode consumir. Os outros pendentes do contato saem
+// junto (1 mensagem por contato), MENOS na checagem de agendamento travado: ela só
+// avisa o time, e o follow-up do lead do mesmo turno segue na fila. ❌ Na 1ª versão
+// (03/11) o aviso consumia esse follow-up, e sem ele a sequência 24h → encerrar não
+// acontecia: o card ficava aberto pra sempre. Exportado pro teste.
+export function reservarFollowup(f, conn = db) {
+  if (!conn.prepare('UPDATE followups SET sent = 1 WHERE id = ? AND sent = 0').run(f.id).changes) return false;
+  if (f.reason !== 'agendamento_travado') {
+    conn.prepare('UPDATE followups SET sent = 1 WHERE contact_id = ? AND sent = 0').run(f.contact_id);
+  }
+  return true;
+}
+
+// Texto do follow-up pro lead (f = linha de SQL_FOLLOWUPS_VENCIDOS). Exportado pro
+// teste (scripts/test-followup-horario.mjs).
+export function textoFollowup(f) {
+  // ⚠️ NÃO usa o nome cru do contato. O WhatsApp entrega coisas como
+  // "mariozeferino698", "216681834" ou o próprio telefone como nome — e o
+  // follow-up saía "Oi mariozeferino698," (queixa da LC 25/09: "usou nome de
+  // contato, ela não devia responder dessa forma"). Sem nome válido, saúda sem nome.
+  const primeiro = (f.name || '').trim().split(/\s+/)[0] || '';
+  const nomeValido = primeiro.length >= 2 && !/\d/.test(primeiro) && !/^[\W_]+$/.test(primeiro);
+  const saudacao = nomeValido ? `Oi ${primeiro}, ` : 'Oi, ';
+  // Textos reescritos (queixa do Gabriel, 25/08): o follow-up antigo abria com
+  // "dei uma sumida, me desculpa" — a Tina se acusava de sumir, o lead não
+  // entendia do que se tratava e respondia "?" ou "não entendi". Agora ela se
+  // identifica, lembra o CONTEXTO (o livro dele) e faz UMA pergunta simples.
+  // FASE JÁ RESPONDIDA (funnel gravado) → os toques não perguntam de novo (invariante
+  // 2). Até 03/11 os dois terminavam sempre pedindo a fase, inclusive pra quem tinha
+  // acabado de dizer "já publiquei"; com o follow-up saindo 1h depois do silêncio (e
+  // não mais às 21h), isso chegaria a muito mais leads. Sem fase, texto de 25/08.
+  const faseConhecida = ['escrever', 'publicar', 'divulgar'].includes(f.funnel);
+  return f.reason === 'silencio_sdr'
+    ? `${saudacao}passando pra te dar um retorno. O time já foi avisado, mas pra não te deixar sem resposta: me conta rapidinho o que você precisa? Assim eu agilizo por aqui 😊`
+    : f.reason === 'silencio_lead_24h'
+      ? `${saudacao}aqui é a Tina, do Grupo LC 😊 Só pra não deixar passar: ainda posso te ajudar com o seu livro?${faseConhecida ? '' : ' Se fizer sentido, me diz em que fase você está — escrevendo, pronto pra publicar, ou já lançado e quer divulgar.'}`
+      : `${saudacao}aqui é a Tina, do Grupo LC 😊 Nossa conversa sobre o seu livro ficou parada por aqui. Você ainda tem interesse em seguir?${faseConhecida ? '' : ' Me conta em que fase está: escrevendo, pronto pra publicar, ou já lançado e quer divulgar.'}`;
+}
+
 // Processa follow-ups vencidos: lead/SDR em silêncio → IA retoma com mensagem leve.
 // IMPORTANTE: processa só 1 follow-up por contato por tick. Mesmo que o banco
 // tenha 5 follow-ups acumulados, manda só 1 mensagem e marca todos como sent.
 async function processFollowups() {
-  const due = db.prepare(`
-    SELECT f.*, c.id as contact_id, c.ghl_contact_id, c.name, c.phone, c.ai_paused, c.stage, c.last_inbound_at
-    FROM followups f
-    JOIN contacts c ON c.id = f.contact_id
-    WHERE f.sent = 0 AND f.due_at <= datetime('now')
-      AND f.id = (
-        SELECT MIN(id) FROM followups
-        WHERE contact_id = f.contact_id AND sent = 0
-      )
-    LIMIT 20
-  `).all();
+  // HORÁRIO COMERCIAL (o mesmo expediente do time: ATENDIMENTO_DIAS/HORA_INI/FIM).
+  // Fora dele, follow-up pro lead fica pendente e sai na abertura. Filtrado no SQL,
+  // não no loop: os pendentes da noite não ocupam o LIMIT dos avisos pro time.
+  const aberto = expediente().aberto;
+  const due = db.prepare(SQL_FOLLOWUPS_VENCIDOS).all(aberto ? 1 : 0, ...SEM_MENSAGEM_PRO_LEAD);
 
   for (const f of due) {
     try {
-      // Defensa em camadas: marca TODOS os follow-ups pendentes do contato como
-      // sent ANTES de processar. Garante que mesmo se algo der erro depois,
-      // não vai disparar duplicado.
-      db.prepare('UPDATE followups SET sent = 1 WHERE contact_id = ? AND sent = 0').run(f.contact_id);
+      if (!reservarFollowup(f)) continue;
+
+      // AGENDAMENTO TRAVADO: o lead pediu pra agendar e, passado o prazo, nenhuma
+      // reunião foi marcada. NÃO manda mensagem pro lead — avisa o TIME, que antes
+      // não ficava sabendo de nada (queixa "lead não foi informado no grupo").
+      // ⚠️ Vem ANTES dos gates de stage, ai_paused e outro time: eles protegem o LEAD
+      // de mensagem da Tina, e aqui ninguém escreve pro lead. ❌ Depois deles, o caso
+      // que motivou a rede do webhook (Marcos, 29/10: terminou no "falar agora", com a
+      // IA pausada) nunca avisava ninguém. Humano que responde o lead já cancela a
+      // checagem (handleSDRReply), e quem já está com alguém ('handoff': assumido no
+      // painel, editorial, cursos) não avisa; fora isso, só não avisa se a reunião saiu.
+      if (f.reason === 'agendamento_travado') {
+        if (['agendado', 'desqualificado', 'handoff'].includes(f.stage)) continue;
+        if (await upcomingAppointment({ id: f.contact_id, ghl_contact_id: f.ghl_contact_id })) continue;
+        logger.warn({ contactId: f.contact_id }, 'agendamento travado — avisando o time');
+        await notifyAgendamentoTravado(
+          { id: f.contact_id, ghl_contact_id: f.ghl_contact_id, name: f.name, phone: f.phone },
+          { desde: f.created_at },
+        ).catch(err => logger.warn({ err: err.message, contactId: f.contact_id }, 'falha avisando agendamento travado'));
+        continue;
+      }
 
       // Se já foi desqualificado, agendado, qualificado (handoff feito) ou
       // está em handoff, NÃO manda follow-up. Risco era a Tina mandar
@@ -67,20 +143,6 @@ async function processFollowups() {
         continue;
       }
 
-      // AGENDAMENTO TRAVADO: o lead pediu pra agendar e, passado o prazo, nenhuma
-      // reunião foi marcada. NÃO manda mensagem pro lead — avisa o TIME, que antes
-      // não ficava sabendo de nada (queixa "lead não foi informado no grupo").
-      // Roda depois do gate de reunião futura acima: se fechou, nem chega aqui.
-      if (f.reason === 'agendamento_travado') {
-        if (f.stage === 'agendado') continue;              // fechou no meio do caminho
-        logger.warn({ contactId: f.contact_id }, 'agendamento travado — avisando o time');
-        await notifyAgendamentoTravado(
-          { id: f.contact_id, ghl_contact_id: f.ghl_contact_id, name: f.name, phone: f.phone },
-          { desde: f.created_at },
-        ).catch(err => logger.warn({ err: err.message, contactId: f.contact_id }, 'falha avisando agendamento travado'));
-        continue;
-      }
-
       // ENCERRAMENTO SEM RESPOSTA: não manda mensagem nenhuma, só FECHA o card do
       // lead que nunca respondeu (regra LC 25/08). Fica DEPOIS de todos os gates
       // acima de propósito: se o lead virou agendado/qualificado, se um humano
@@ -98,22 +160,12 @@ async function processFollowups() {
         continue;
       }
 
-      // ⚠️ NÃO usa o nome cru do contato. O WhatsApp entrega coisas como
-      // "mariozeferino698", "216681834" ou o próprio telefone como nome — e o
-      // follow-up saía "Oi mariozeferino698," (queixa da LC 25/09: "usou nome de
-      // contato, ela não devia responder dessa forma"). Sem nome válido, saúda sem nome.
-      const primeiro = (f.name || '').trim().split(/\s+/)[0] || '';
-      const nomeValido = primeiro.length >= 2 && !/\d/.test(primeiro) && !/^[\W_]+$/.test(primeiro);
-      const saudacao = nomeValido ? `Oi ${primeiro}, ` : 'Oi, ';
-      // Textos reescritos (queixa do Gabriel, 25/08): o follow-up antigo abria com
-      // "dei uma sumida, me desculpa" — a Tina se acusava de sumir, o lead não
-      // entendia do que se tratava e respondia "?" ou "não entendi". Agora ela se
-      // identifica, lembra o CONTEXTO (o livro dele) e faz UMA pergunta simples.
-      const txt = f.reason === 'silencio_sdr'
-        ? `${saudacao}passando pra te dar um retorno. O time já foi avisado, mas pra não te deixar sem resposta: me conta rapidinho o que você precisa? Assim eu agilizo por aqui 😊`
-        : f.reason === 'silencio_lead_24h'
-          ? `${saudacao}aqui é a Tina, do Grupo LC 😊 Só pra não deixar passar: ainda posso te ajudar com o seu livro? Se fizer sentido, me diz em que fase você está — escrevendo, pronto pra publicar, ou já lançado e quer divulgar.`
-          : `${saudacao}aqui é a Tina, do Grupo LC 😊 Nossa conversa sobre o seu livro ficou parada por aqui. Você ainda tem interesse em seguir? Me conta em que fase está: escrevendo, pronto pra publicar, ou já lançado e quer divulgar.`;
+      // ⚠️ SEM trava de 24h aqui, de propósito. Levantamento no GHL (04/10–04/11):
+      // dos 207 segundos toques, todos com mais de 24h, 166 foram entregues ou lidos —
+      // lead de anúncio de clique pro WhatsApp tem janela de 72h. Fora da janela o GHL
+      // aceita o envio e só marca "failed" segundos depois; a sequência segue igual.
+
+      const txt = textoFollowup(f);
 
       markTinaSent(await GHL.sendMessage({
         contactId: f.ghl_contact_id,

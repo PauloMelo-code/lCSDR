@@ -43,6 +43,18 @@ export function upsertContactFromGHL(ghlContact) {
   return db.prepare('SELECT * FROM contacts WHERE id = ?').get(info.lastInsertRowid);
 }
 
+// Cancela os pendentes do contato, MENOS a checagem de agendamento travado: ela é
+// aviso pro TIME, não mensagem pro lead. Vale pro lead respondendo (recordInbound) e
+// pro fim de turno (scheduleFollowup). ❌ Antes os dois cancelavam a checagem: o
+// horário prometido no passo 7.8 do webhook morria no scheduleFollowup do mesmo
+// turno, e o "amanhã às 10h" do lead matava a checagem da oferta de horário. Quem
+// escolhia o horário e travava no e-mail era declinado sem o time saber (revisão
+// 04/11). Quem resolve o agendamento (marcou, já tinha reunião, escalou, humano
+// respondeu) cancela tudo explicitamente, e o scheduler reconfere estágio e
+// reunião futura antes de avisar.
+export const SQL_CANCELA_PENDENTES =
+  `UPDATE followups SET sent = 1 WHERE contact_id = ? AND sent = 0 AND reason <> 'agendamento_travado'`;
+
 export function recordInbound(contactId, { content, content_type = 'text', ghl_message_id = null, attachment_url = null } = {}) {
   db.prepare(`
     INSERT INTO messages (contact_id, ghl_message_id, direction, author, content, content_type, raw_attachment_url)
@@ -57,7 +69,7 @@ export function recordInbound(contactId, { content, content_type = 'text', ghl_m
   db.prepare('UPDATE contacts SET last_inbound_at = CURRENT_TIMESTAMP WHERE id = ?').run(contactId);
   // Lead respondeu → cancela follow-ups pendentes desse contato.
   // Não faz sentido mandar "dei uma sumida" pra quem acabou de falar.
-  db.prepare('UPDATE followups SET sent = 1 WHERE contact_id = ? AND sent = 0').run(contactId);
+  db.prepare(SQL_CANCELA_PENDENTES).run(contactId);
 }
 
 export function recordOutbound(contactId, { author = 'ia', content, sdr_id = null, usage = {} }) {

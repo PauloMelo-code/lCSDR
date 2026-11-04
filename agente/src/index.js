@@ -136,6 +136,9 @@ app.get('/health', (_, res) => {
         // Só o booleano: a URL não é segredo, mas poluiria o /health.
         imagemAgendamento: Boolean((process.env.GHL_IMAGEM_AGENDAMENTO_URL || '').trim()),
         followup: process.env.FOLLOWUP_ENABLED === 'true',
+        // Minutos de silêncio até o 1º toque. Até 03/11 um bug fazia todo follow-up
+        // sair às 21h BRT; agora sai neste prazo, só no expediente (scheduler.js).
+        followupSilenceMin: Number(process.env.FOLLOWUP_SILENCE_MINUTES || 60),
         // Lembrete de compromisso pela Tina no WhatsApp (pedido Lilian 21/10). Convive
         // com o e-mail do GHL de proposito: a Tina esbarra na janela de 24h e o e-mail
         // e a rede de seguranca. Texto muda entre ligacao e reuniao.

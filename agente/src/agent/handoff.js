@@ -3,6 +3,7 @@ import { GHL } from '../ghl/client.js';
 import { writeQualificationFields } from '../ghl/customFields.js';
 import { createOrMoveOpportunityQualified, resolvePipeline } from '../ghl/opportunities.js';
 import { upcomingAppointment } from './scheduling.js';
+import { SQL_CANCELA_PENDENTES } from './contactService.js';
 import { logger } from '../utils/logger.js';
 
 const FOLLOWUP_MIN = Number(process.env.FOLLOWUP_SILENCE_MINUTES || 60);
@@ -146,7 +147,7 @@ const FOLLOWUP_SDR_ENABLED = process.env.FOLLOWUP_SILENCIO_SDR_ENABLED === 'true
 export function scheduleFollowup(contactId, reason = 'silencio_lead', minutesFromNow = FOLLOWUP_MIN) {
   // SDR pura: sem follow-up. Só cancela pendências antigas e sai.
   if (!FOLLOWUP_ENABLED) {
-    db.prepare('UPDATE followups SET sent = 1 WHERE contact_id = ? AND sent = 0').run(contactId);
+    db.prepare(SQL_CANCELA_PENDENTES).run(contactId);
     return;
   }
   // Pula o follow-up de silencio_sdr se desativado por env.
@@ -157,7 +158,7 @@ export function scheduleFollowup(contactId, reason = 'silencio_lead', minutesFro
   // Sem isso, cada turno da conversa criava um follow-up novo. Quando o primeiro
   // vence (1h), TODOS os outros já estão vencidos também e disparam juntos
   // → o lead recebe a mesma mensagem 5x.
-  db.prepare('UPDATE followups SET sent = 1 WHERE contact_id = ? AND sent = 0').run(contactId);
+  db.prepare(SQL_CANCELA_PENDENTES).run(contactId);
   const due = new Date(Date.now() + minutesFromNow * 60_000).toISOString();
   db.prepare(`
     INSERT INTO followups (contact_id, due_at, reason) VALUES (?, ?, ?)
