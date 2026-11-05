@@ -88,6 +88,32 @@ function diaEHoraBRT(d) {
   return { dow, hora: Number(p.hour) + Number(p.minute) / 60 };
 }
 
+// Hora de reunião vinda do GHL → instante (ms). O /contacts/{id}/appointments devolve
+// 'AAAA-MM-DD HH:mm:ss' SEM fuso, no horário da location (BRT); o /calendars/events vem
+// com -03:00. new Date() da hora sem fuso usa o fuso do SERVIDOR (UTC) e põe a reunião 3h
+// antes. ❌ Nas 3h antes da reunião a Tina achava que ela já tinha passado: follow-up,
+// encerramento do card e "agendamento travado" para lead com reunião marcada.
+// Também vale para o book_slot que o LLM copia da lista: sem o -03:00, é BRT.
+// Número: ele mesmo. Com fuso ou outro formato: igual ao Date.parse (ilegível = NaN).
+// Não usar em data do SQLite (é UTC).
+export function instanteGhl(v) {
+  if (typeof v === 'number') return v;
+  const s = String(v ?? '').trim();
+  if (/^\d+$/.test(s)) return Number(s);
+  const m = s.match(/^(\d{4})-(\d\d)-(\d\d)[ T](\d\d):(\d\d)(?::(\d\d)(?:\.\d+)?)?$/);
+  if (!m) return Date.parse(s);
+  const parede = Date.UTC(+m[1], m[2] - 1, +m[3], +m[4], +m[5], +(m[6] || 0));
+  // fuso da location no instante t (BRT = -3h). Duas passadas acertam também a troca de
+  // horário de verão, se ele voltar ou se GHL_TIMEZONE for de um fuso que tem.
+  const fuso = t => {
+    const p = Object.fromEntries(new Intl.DateTimeFormat('en-US', {
+      timeZone: TIMEZONE, hourCycle: 'h23', year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric',
+    }).formatToParts(new Date(t)).map(x => [x.type, x.value]));
+    return Date.UTC(+p.year, p.month - 1, +p.day, +p.hour, +p.minute, +p.second) - t;
+  };
+  return parede - fuso(parede - fuso(parede));
+}
+
 /**
  * O time humano está atendendo agora? E quando é a próxima abertura?
  * @returns {{ aberto: boolean, proxima: string, faixa: string }}
@@ -291,7 +317,7 @@ export async function getNextSlots(count = 3, { fromDate = new Date(), spread = 
 // no BR já é o dia seguinte em UTC, e o toDateString() do servidor fazia "amanhã 16h"
 // virar "hoje 16h" no aviso do grupo.
 export function labelForSlot(iso) {
-  const d = new Date(iso);
+  const d = new Date(instanteGhl(iso));   // hora sem fuso (GHL, book_slot) é BRT
   const now = new Date();
   const brtDay = x => new Intl.DateTimeFormat('en-CA', { timeZone: TIMEZONE, year: 'numeric', month: '2-digit', day: '2-digit' }).format(x);
   const dDay = brtDay(d), nowDay = brtDay(now), tomDay = brtDay(new Date(now.getTime() + 86_400_000));
@@ -401,11 +427,11 @@ export async function upcomingAppointment(contact) {
     if (!Array.isArray(events) || !events.length) return null;
     const now = Date.now();
     const ativos = events.filter(e => {
-      const st = new Date(e.startTime || e.startedAt || 0).getTime();
+      const st = instanteGhl(e.startTime || e.startedAt);
       const status = String(e.appointmentStatus || e.status || '').toLowerCase();
       const morta = /cancel|invalid|noshow|no-show|deleted/.test(status);
       return st > now && !morta;
-    }).sort((a, b) => new Date(a.startTime) - new Date(b.startTime));
+    }).sort((a, b) => instanteGhl(a.startTime || a.startedAt) - instanteGhl(b.startTime || b.startedAt));
     return ativos[0] || null;
   } catch (err) {
     logger.warn({ err: err.message, contactId: contact.id }, 'falha checando reunião existente; segue (fail-open)');
@@ -433,8 +459,8 @@ async function slotHasConflict(calendarId, startMs, endMs) {
     return events.some(e => {
       const status = String(e.appointmentStatus || e.status || '').toLowerCase();
       if (/cancel|invalid|noshow|no-show|deleted/.test(status)) return false;
-      const es = new Date(e.startTime || e.startedAt || 0).getTime();
-      const ee = new Date(e.endTime || e.endedAt || es).getTime();
+      const es = instanteGhl(e.startTime || e.startedAt);
+      const ee = instanteGhl(e.endTime || e.endedAt || es);
       if (!es) return false;
       return aStart < ee && aEnd > es; // sobreposição (bordas que só encostam NÃO colidem)
     });
@@ -490,8 +516,11 @@ export async function bookSlot(contact, iso, { title, notes, assignedUserId } = 
   if (!schedulingEnabled()) return { ok: false, error: 'scheduling desativado' };
   if (!iso) return { ok: false, error: 'iso vazio' };
 
-  const start = new Date(iso);
+  // O LLM copia o ISO da lista (com -03:00). Se vier sem fuso, é BRT: lido pelo fuso do
+  // servidor, marcaria 3h antes e fora do calendário do closer oferecido.
+  const start = new Date(instanteGhl(iso));
   if (isNaN(start.getTime())) return { ok: false, error: 'iso inválido' };
+  iso = start.toISOString();
   // Defensivo: nunca marca fora do expediente, mesmo se a IA passar um horário que o
   // lead pediu (fora da lista oferecida). O webhook trata ok:false ("mantém agendando").
   if (!withinBusinessHours(iso)) {
