@@ -15,11 +15,10 @@
 // inbound do lead (nunca outbound frio).
 import fetch from 'node-fetch';
 import { GHL } from '../ghl/client.js';
-import { contactExclusivelyInTinaLane } from '../ghl/opportunities.js';
+import { contactExclusivelyInTinaLane, resolvePipeline } from '../ghl/opportunities.js';
 import { logger } from '../utils/logger.js';
 
 const B = 'https://services.leadconnectorhq.com';
-const ORG_STAGE = process.env.ORGANICO_STAGE_ID || 'd596db34-ada4-4e7a-936a-943a9410d9a6';
 const AUTO = new Set(['workflow', 'campaign', 'bulk_actions', 'bulk', 'automation']);
 
 function sdrActiveMs() {
@@ -30,6 +29,9 @@ function sdrActiveMs() {
 async function fetchOrgOpps() {
   if (!process.env.GHL_API_TOKEN || !process.env.GHL_LOCATION_ID) return [];
   const H = { Authorization: 'Bearer ' + process.env.GHL_API_TOKEN, Version: (process.env.GHL_API_VERSION || '2021-07-28'), Accept: 'application/json' };
+  // Coluna Funil Orgânico: ORGANICO_STAGE_ID ou o padrão único de opportunities.js (o
+  // mesmo do GHL_TINA_OWNED_STAGES).
+  const ORG_STAGE = resolvePipeline().stageOrganico;
   const out = [];
   for (let page = 1; page <= 15; page++) {
     const r = await fetch(`${B}/opportunities/search?location_id=${process.env.GHL_LOCATION_ID}&pipeline_stage_id=${ORG_STAGE}&status=open&limit=100&page=${page}`, { headers: H });

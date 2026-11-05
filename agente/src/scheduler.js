@@ -249,9 +249,9 @@ async function maybeSendResumoDia() {
 // DESLIGADA (ORGANICO_SWEEP_ENABLED=true pra ligar). Roda a cada ORGANICO_SWEEP_MINUTES
 // (default 30), no máx. ORGANICO_SWEEP_MAX leads por rodada (default 12). Idempotente:
 // o cooldown de 12h do handleOpportunityStage evita re-responder o mesmo lead.
-const SWEEP_ON = process.env.ORGANICO_SWEEP_ENABLED === 'true';
-const SWEEP_INTERVAL_MS = Math.max(5, Number(process.env.ORGANICO_SWEEP_MINUTES) || 30) * 60_000;
-const SWEEP_MAX = Math.max(1, Number(process.env.ORGANICO_SWEEP_MAX) || 12);
+export const SWEEP_ON = process.env.ORGANICO_SWEEP_ENABLED === 'true';
+export const SWEEP_INTERVAL_MS = Math.max(5, Number(process.env.ORGANICO_SWEEP_MINUTES) || 30) * 60_000;
+export const SWEEP_MAX = Math.max(1, Number(process.env.ORGANICO_SWEEP_MAX) || 12);
 let _sweepLast = 0;
 let _sweepRunning = false;
 

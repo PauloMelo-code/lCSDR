@@ -5,3 +5,7 @@ node_modules/
 data/
 logs/
 .DS_Store
+
+# dado de lead (triagem/backup da coluna IA Tina): nunca comitar
+scripts/triagem-iatina*.json
+scripts/backup-fechados*.json

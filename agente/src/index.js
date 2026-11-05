@@ -7,13 +7,15 @@ import cors from 'cors';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 import { logger } from './utils/logger.js';
-import webhookRoutes from './routes/webhook.js';
+import webhookRoutes, { CRM_GATES } from './routes/webhook.js';
 import webhookUazapiRoutes from './routes/webhookUazapi.js';
 import authRoutes from './routes/auth.js';
 import dashboardRoutes from './routes/dashboard.js';
 import playgroundRoutes from './routes/playground.js';
 import internalRoutes from './routes/internal.js';
-import { startScheduler } from './scheduler.js';
+import { startScheduler, SWEEP_ON, SWEEP_INTERVAL_MS, SWEEP_MAX } from './scheduler.js';
+import { crmConfig, estadoChecagemCrm, iniciarChecagemCrm } from './ghl/opportunities.js';
+import { DECLINE_ON_DISQUALIFY } from './agent/handoff.js';
 import { captureRawBody } from './ghl/webhookSig.js';
 import { refreshCustomFieldsCache } from './ghl/customFields.js';
 import { preferredChannel } from './agent/messenger.js';
@@ -204,6 +206,22 @@ app.get('/health', (_, res) => {
         // LC; o default não afirma ser pessoa.
         personaRespostaIa: Boolean(process.env.PERSONA_RESPOSTA_IA),
       },
+      // Tudo que amarra a Tina aos funis e colunas do GHL, já RESOLVIDO (env ou padrão):
+      // ids, booleanos e números, nunca token. Existe pra reorganização do CRM (04/11):
+      // antes de mexer numa coluna, dá pra ver aqui de quais ids a Tina depende.
+      // `faltando`/`checagem` vêm de uma checagem em segundo plano (boot + 30 min); o
+      // /health só lê o cache e não chama o GHL. `faltando: []` = todos os ids existem.
+      // Os modos que escolhem entre puxar ou criar card (attendExceptReentrada,
+      // ownsEntryLane, autoHumanDetection) continuam em `cfg`.
+      crm: {
+        ...crmConfig(),
+        ...CRM_GATES,
+        declineOppOnDisqualify: DECLINE_ON_DISQUALIFY,
+        organicoSweep: SWEEP_ON,
+        organicoSweepMin: SWEEP_INTERVAL_MS / 60_000,
+        organicoSweepMax: SWEEP_MAX,
+        ...estadoChecagemCrm(),
+      },
     });
   } catch (err) {
     logger.error({ err: err.message }, 'health check falhou');
@@ -235,5 +253,7 @@ app.listen(PORT, async () => {
   }, `🤖 Tina online — canal do lead: ${channel.toUpperCase()}`);
   // Pré-carrega cache de custom fields do GHL (não-bloqueante)
   refreshCustomFieldsCache().catch(() => {});
+  // Confere os ids de funil/coluna no GHL (boot + 30 min); resultado vai pro /health.
+  iniciarChecagemCrm();
   startScheduler();
 });

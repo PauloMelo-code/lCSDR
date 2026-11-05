@@ -19,7 +19,7 @@ import {
   upcomingAppointment, NO_SLOTS_CONTEXT, calendariosParaServico, slotModality, expediente, labelForSlot,
 } from '../agent/scheduling.js';
 import { bookSearchEnabled, searchBookLink } from '../agent/bookSearch.js';
-import { contactOppOutsideTinaLane, moveLeadToIaTina, claimToIaTina, resolvePipeline, contactInIaTinaLane, contactOppInReentrada, contactWorkedByOtherTeam, contactExclusivelyInTinaLane, closeSdrOppOnBooking, contactIsConvertedCustomer } from '../ghl/opportunities.js';
+import { contactOppOutsideTinaLane, moveLeadToIaTina, claimToIaTina, resolvePipeline, contactInIaTinaLane, contactOppInReentrada, contactWorkedByOtherTeam, contactExclusivelyInTinaLane, closeSdrOppOnBooking, contactIsConvertedCustomer, eventoDeCardFechado } from '../ghl/opportunities.js';
 import { liveHandoff } from '../agent/queue.js';
 import { sincronizarDonoDoLead, donoDoContato, personaEnabled } from '../agent/persona.js';
 import { notifyAgendamento, notifyLiveHandoff, notifyIaTinaForaJanela, notifyAgendamentoPrecisaTime } from '../agent/notify.js';
@@ -531,6 +531,15 @@ const SELF_MOVE_TTL_MS = Number(process.env.IA_TINA_SELF_MOVE_TTL_MIN || 30) * 6
 // Cooldown: não re-aborda o mesmo lead em continuidade dentro de N horas (cobre
 // retries do GHL e re-arrasto do card). Re-arrasto legítimo dias depois funciona.
 const CONTINUATION_COOLDOWN_MS = Number(process.env.IA_TINA_CONTINUATION_COOLDOWN_H || 12) * 3600_000;
+// Gates de funil/coluna deste arquivo, já resolvidos — o /health mostra no bloco `crm`.
+export const CRM_GATES = {
+  skipReentradaOpp: SKIP_REENTRADA_OPP,
+  laneGate: process.env.LANE_GATE_ENABLED === 'true',
+  iaTinaContinuation: IA_TINA_CONTINUATION,
+  iaTinaTriggerKinds: IA_TINA_TRIGGER_KINDS,
+  iaTinaSelfMoveTtlMin: SELF_MOVE_TTL_MS / 60_000,
+  iaTinaContinuationCooldownH: CONTINUATION_COOLDOWN_MS / 3600_000,
+};
 const WHATSAPP_WINDOW_MS = 24 * 3600 * 1000;
 
 // Gatilho interno (vira o "turno do usuário" só se a conversa não terminou já
@@ -649,6 +658,12 @@ export async function handleOpportunityStage(event) {
   if (!trusted) {
     if (!stageId || stageId !== stageIaTina) return;
     if (oppPipelineId && pipelineId && oppPipelineId !== pipelineId) return;
+  }
+  // Card fechado (lost/won) não é retomado, nem pelo tipo confiável. Depois do filtro de
+  // coluna: fechamento em outro funil continua saindo calado, sem poluir o log.
+  if (eventoDeCardFechado(event)) {
+    logger.info({ oppId, kind: event.type }, 'evento IA Tina de card fechado, ignorando');
+    return;
   }
   if (!ghlContactId) {
     logger.warn({ oppId, kind: event.type }, 'evento IA Tina sem contactId resolvível — ignorando');

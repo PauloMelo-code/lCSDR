@@ -17,6 +17,13 @@ let PIPELINE_CACHE = null;
 const DEFAULT_PIPELINE_ID = 'MfDNcFdH03j0ZBuwJDYM';
 const DEFAULT_STAGE_QUALIFIED = '0c040fa3-3ed5-449f-ab07-c7b3fb40f97c'; // Aguardando Atendimento
 const DEFAULT_STAGE_IA_TINA = '74164182-d3b0-447b-a761-3bdcd6d47eac';    // IA Tina
+// Funil Orgânico. Fonte ÚNICA do id: a varredura (organicoSweep.js, via stageOrganico)
+// e o padrão de GHL_TINA_OWNED_STAGES leem daqui. Antes o id estava escrito nos dois
+// arquivos — na reorganização do CRM (04/11) trocar um e esquecer o outro faria a
+// varredura achar os leads e a raia exclusiva recusar todos.
+const DEFAULT_STAGE_ORGANICO = 'd596db34-ada4-4e7a-936a-943a9410d9a6';
+
+const csv = raw => String(raw || '').split(',').map(s => s.trim()).filter(Boolean);
 
 export function resolvePipeline() {
   if (PIPELINE_CACHE) return PIPELINE_CACHE;
@@ -24,8 +31,42 @@ export function resolvePipeline() {
     pipelineId: process.env.GHL_PIPELINE_ID || DEFAULT_PIPELINE_ID,
     stageQualified: process.env.GHL_PIPELINE_STAGE_QUALIFIED || DEFAULT_STAGE_QUALIFIED,
     stageIaTina: process.env.GHL_PIPELINE_STAGE_IA_TINA || DEFAULT_STAGE_IA_TINA,
+    stageOrganico: process.env.ORGANICO_STAGE_ID || DEFAULT_STAGE_ORGANICO,
   };
   return PIPELINE_CACHE;
+}
+
+// Motivo de perda nos cards que a Tina fecha. DESLIGADO por padrão: env vazia = card
+// vai pra lost sem motivo, como sempre foi. Lido a cada chamada.
+export const lostReasonAgendou = () => (process.env.TINA_LOST_REASON_BOOKED_ID || '').trim() || null;
+export const lostReasonDesqualificou = () => (process.env.TINA_LOST_REASON_DISQUALIFIED_ID || '').trim() || null;
+// Encerrado sem resposta (closeLeadNoResponse) NÃO é desqualificado: motivo próprio, pra
+// não misturar os dois no relatório de perdas (proposta de reorganização, pág. 9).
+export const lostReasonSemResposta = () => (process.env.TINA_LOST_REASON_NO_RESPONSE_ID || '').trim() || null;
+
+// Grava o motivo num card que JÁ foi fechado como lost. Na doc da API v2 o lostReasonId
+// não existe no PUT /opportunities/:id (o que fecha o card), só no PUT
+// /opportunities/:id/status — por isso vai numa 2ª chamada, depois do fechamento: se
+// ela falhar, o card continua fechado (invariante 9) e só fica sem motivo.
+// Falhas contadas pro /health (crm.motivoPerdaFalhas): id de motivo errado só aparecia no log.
+let MOTIVO_FALHAS = { n: 0, ultimoStatus: null, em: null };
+export async function gravarMotivoPerda(oppId, lostReasonId, contactId) {
+  if (!lostReasonId) return;
+  try {
+    await GHL.updateOpportunityStatus(oppId, { status: 'lost', lostReasonId });
+  } catch (err) {
+    MOTIVO_FALHAS = { n: MOTIVO_FALHAS.n + 1, ultimoStatus: err.status || null, em: new Date().toISOString() };
+    logger.warn({ err: err.message, contactId, oppId }, 'falha gravando motivo de perda (card já fechado; segue)');
+  }
+}
+
+// Evento de card JÁ FECHADO (lost/won/abandoned). A continuidade da IA Tina não pode
+// retomar a conversa de um lead que acabou de ser fechado: o card fechado continua na
+// coluna IA Tina, e fechamento em massa (limpeza) ou a 2ª chamada do motivo de perda
+// geram OpportunityStatusUpdate. Sem status no evento = segue como antes.
+export function eventoDeCardFechado(event) {
+  const st = String(event?.status || event?.opportunity?.status || '').toLowerCase();
+  return /^(lost|won|abandon)/.test(st);
 }
 
 // Escolhe a oportunidade RELEVANTE do contato (em vez de `ops[0]` cego, que é
@@ -115,6 +156,7 @@ export async function closeSdrOppOnBooking(contact) {
       if (o.pipelineId !== pipelineId) continue;   // só o Pré-Vendas da Tina
       await GHL.updateOpportunity(o.id, { pipelineId: o.pipelineId, pipelineStageId: o.pipelineStageId, status: closeStatus });
       logger.info({ contactId: contact.id, oppId: o.id, closeStatus }, 'agendou: card Pré-Vendas declinado pra não duplicar');
+      if (closeStatus === 'lost') await gravarMotivoPerda(o.id, lostReasonAgendou(), contact.id);
     }
   } catch (err) {
     logger.warn({ err: err.message, contactId: contact.id }, 'falha fechando card Pré-Vendas no agendamento (segue)');
@@ -127,13 +169,18 @@ export async function closeSdrOppOnBooking(contact) {
 // (CSV de stageIds). A Tina move pra "Aguardando Atendimento", nunca pra essas,
 // então não há conflito com o que ela mesma cria.
 function blockedOppStages() {
-  const raw = process.env.GHL_BLOCK_OPP_STAGES || [
+  return csv(process.env.GHL_BLOCK_OPP_STAGES || [
     'b661d5f1-69cd-4531-8be9-79b3e11c862f', // Reentrada — Pré-Vendas LCA (SDR)
-    '009b6a60-2c9b-41f9-95d3-20d54c18ab8d', // Reentrada — LC Editorial
+    '009b6a60-2c9b-41f9-95d3-20d54c18ab8d', // Reentrada — LC Books (SDR & Closers)
     'ee211407-4153-4a93-bf03-0b9ff000effe', // Reentrada — Pré-Vendas 2.0 (SDR1)
-  ].join(',');
-  return raw.split(',').map(s => s.trim()).filter(Boolean);
+  ].join(','));
 }
+
+// Stages que a Tina é DONA (guarda do reclaim, contactExclusivelyInTinaLane): IA Tina
+// + estas. Padrão: Funil Orgânico.
+const tinaOwnedStages = () => csv(process.env.GHL_TINA_OWNED_STAGES || resolvePipeline().stageOrganico);
+// Funis de ENTRADA extras da raia (só valem com LANE_GATE_ENABLED). Padrão: nenhum.
+const tinaLaneStages = () => csv(process.env.GHL_TINA_LANE_STAGES);
 
 // A "RAIA" da Tina (allowlist, default-deny). Ela só atende lead cuja
 // oportunidade está na IA Tina ou na Aguardando Atendimento (qualificado/
@@ -147,8 +194,7 @@ export async function contactOppOutsideTinaLane(contact) {
   // Raia da Tina = IA Tina + Aguardando Atendimento + funis de ENTRADA onde caem
   // os leads de anúncio/captação que ela DEVE qualificar (env GHL_TINA_LANE_STAGES,
   // CSV de stageIds). Setar os funis de entrada lá pra a Tina atender os anúncios.
-  const extra = (process.env.GHL_TINA_LANE_STAGES || '').split(',').map(s => s.trim()).filter(Boolean);
-  const lane = new Set([stageIaTina, stageQualified, ...extra].filter(Boolean));
+  const lane = new Set([stageIaTina, stageQualified, ...tinaLaneStages()].filter(Boolean));
   try {
     const r = await GHL.getOpportunitiesByContact(contact.ghl_contact_id);
     const ops = r?.opportunities || (Array.isArray(r) ? r : []);
@@ -190,10 +236,7 @@ export async function contactInIaTinaLane(contact) {
 export async function contactExclusivelyInTinaLane(contact) {
   if (!contact?.ghl_contact_id || !process.env.GHL_API_TOKEN) return false;
   const { stageIaTina } = resolvePipeline();
-  const extra = (process.env.GHL_TINA_OWNED_STAGES
-    || 'd596db34-ada4-4e7a-936a-943a9410d9a6') // Funil Orgânico (Pré-Vendas LCA)
-    .split(',').map(s => s.trim()).filter(Boolean);
-  const owned = new Set([stageIaTina, ...extra].filter(Boolean));
+  const owned = new Set([stageIaTina, ...tinaOwnedStages()].filter(Boolean));
   try {
     const r = await GHL.getOpportunitiesByContact(contact.ghl_contact_id);
     const open = (r?.opportunities || (Array.isArray(r) ? r : []))
@@ -345,6 +388,85 @@ export async function moveLeadToIaTina(contact) {
     logger.warn({ err: err.message, contactId: contact.id }, 'falha criando opp na IA Tina; segue');
     return null;
   }
+}
+
+// === Diagnóstico pro /health (bloco `crm`) ===
+// Valores RESOLVIDOS (env ou padrão) com que este arquivo amarra a Tina aos funis.
+// Só ids, booleanos e números — nunca token. Os gates do webhook/handoff/scheduler
+// entram no index.js, junto com estes.
+export function crmConfig() {
+  return {
+    ...resolvePipeline(),
+    blockOppStages: blockedOppStages(),
+    tinaOwnedStages: tinaOwnedStages(),
+    tinaLaneStages: tinaLaneStages(),
+    skipConvertedCustomers: SKIP_CONVERTED,
+    lostOppBlockDays: LOST_BLOCK_DAYS,
+    closeSdrOppOnBooking: process.env.CLOSE_SDR_OPP_ON_BOOKING !== 'false',
+    scheduledSdrOppStatus: process.env.SCHEDULED_SDR_OPP_STATUS || 'lost',
+    lostReasonBookedId: lostReasonAgendou(),
+    lostReasonDisqualifiedId: lostReasonDesqualificou(),
+    lostReasonNoResponseId: lostReasonSemResposta(),
+    motivoPerdaFalhas: MOTIVO_FALHAS,
+  };
+}
+
+// Ids configurados que NÃO batem com os funis do GHL. Coluna da Tina (IA Tina,
+// Aguardando, Orgânico, donas e raia) tem que estar no funil GHL_PIPELINE_ID: em outro
+// funil, a Tina move pro lugar errado (400) ou o contactWorkedByOtherTeam trata o lead
+// como de outro time. As de bloqueio (Reentrada) podem estar em qualquer funil.
+export function idsFaltando(cfg, pipelines) {
+  const todas = new Set(pipelines.flatMap(p => (p.stages || []).map(s => s.id)));
+  const daTina = pipelines.find(p => p.id === cfg.pipelineId);
+  const doFunil = new Set((daTina?.stages || []).map(s => s.id));
+  const out = [];
+  if (!daTina) out.push({ env: 'GHL_PIPELINE_ID', id: cfg.pipelineId, motivo: 'funil não existe' });
+  const daRaia = {
+    GHL_PIPELINE_STAGE_QUALIFIED: [cfg.stageQualified],
+    GHL_PIPELINE_STAGE_IA_TINA: [cfg.stageIaTina],
+    ORGANICO_STAGE_ID: [cfg.stageOrganico],
+    GHL_TINA_OWNED_STAGES: cfg.tinaOwnedStages,
+    GHL_TINA_LANE_STAGES: cfg.tinaLaneStages,
+  };
+  for (const [env, ids] of Object.entries(daRaia)) {
+    for (const id of ids) {
+      if (!todas.has(id)) out.push({ env, id, motivo: 'coluna não existe' });
+      else if (daTina && !doFunil.has(id)) out.push({ env, id, motivo: 'coluna fora do funil da Tina' });
+    }
+  }
+  for (const id of cfg.blockOppStages) {
+    if (!todas.has(id)) out.push({ env: 'GHL_BLOCK_OPP_STAGES', id, motivo: 'coluna não existe' });
+  }
+  return out;
+}
+
+// A checagem NUNCA roda dentro do /health: roda no boot e a cada 30 min em segundo plano
+// (iniciarChecagemCrm, chamado pelo index.js) e o /health só lê este cache. Falha do
+// GHL vira `checagem.erro` e mantém o último `faltando` bom; o /health segue rápido.
+// Custa 1 GET a cada 30 min no mesmo token que atende os leads.
+let CHECAGEM = { faltando: null, checagem: { em: null, ok: false, erro: 'ainda não rodou' } };
+export const estadoChecagemCrm = () => CHECAGEM;
+
+export async function checarIdsCrm() {
+  const em = new Date().toISOString();
+  try {
+    const pipelines = (await GHL.listPipelines())?.pipelines || [];
+    if (!pipelines.length) throw new Error('GHL devolveu 0 funis');
+    CHECAGEM = { faltando: idsFaltando(crmConfig(), pipelines), checagem: { em, ok: true } };
+  } catch (err) {
+    // Sem a query: a mensagem traz o path com ?locationId=… e o /health é público.
+    CHECAGEM = { faltando: CHECAGEM.faltando, checagem: { em, ok: false, erro: String(err.message).replace(/\?\S*/g, '').slice(0, 200) } };
+  }
+  return CHECAGEM;
+}
+
+export function iniciarChecagemCrm(intervaloMs = 30 * 60_000) {
+  if (!process.env.GHL_API_TOKEN) {
+    CHECAGEM = { faltando: null, checagem: { em: new Date().toISOString(), ok: false, erro: 'GHL_API_TOKEN ausente' } };
+    return;
+  }
+  checarIdsCrm();
+  return setInterval(checarIdsCrm, intervaloMs).unref();   // devolve o timer só pro teste
 }
 
 // Estimativa grosseira de ticket pro campo monetaryValue.

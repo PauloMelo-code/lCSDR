@@ -1,7 +1,7 @@
 import { db } from '../db/index.js';
 import { GHL } from '../ghl/client.js';
 import { writeQualificationFields } from '../ghl/customFields.js';
-import { createOrMoveOpportunityQualified, resolvePipeline } from '../ghl/opportunities.js';
+import { createOrMoveOpportunityQualified, resolvePipeline, gravarMotivoPerda, lostReasonDesqualificou, lostReasonSemResposta } from '../ghl/opportunities.js';
 import { upcomingAppointment } from './scheduling.js';
 import { SQL_CANCELA_PENDENTES } from './contactService.js';
 import { logger } from '../utils/logger.js';
@@ -211,9 +211,10 @@ export async function markQualifiedAndHandoff(contact, result, { pause = true } 
 // reunião futura da agenda (Creusa recusou depois de agendar e a reunião ficou
 // pendurada no calendário). Só toca o pipeline da Tina — card de outro time fica
 // intacto. Fail-open. Desliga com DECLINE_OPP_ON_DISQUALIFY=false.
-const DECLINE_ON_DISQUALIFY = process.env.DECLINE_OPP_ON_DISQUALIFY !== 'false';
+// lostReasonId: quem chama escolhe (desqualificado ≠ sem resposta); null = sem motivo.
+export const DECLINE_ON_DISQUALIFY = process.env.DECLINE_OPP_ON_DISQUALIFY !== 'false';
 
-async function declineOppAndAppointment(contact) {
+export async function declineOppAndAppointment(contact, { lostReasonId = null } = {}) {
   if (!DECLINE_ON_DISQUALIFY || !process.env.GHL_API_TOKEN || isSyntheticId(contact.ghl_contact_id)) return;
   // 1) reunião futura → cancela (tira da agenda do closer)
   try {
@@ -236,6 +237,7 @@ async function declineOppAndAppointment(contact) {
       if (o.pipelineId !== pipelineId) continue; // nunca mexe em card de outro time
       await GHL.updateOpportunity(o.id, { pipelineId: o.pipelineId, pipelineStageId: o.pipelineStageId, status: 'lost' });
       logger.info({ contactId: contact.id, oppId: o.id }, 'desqualificado: card declinado (lost) no GHL');
+      await gravarMotivoPerda(o.id, lostReasonId, contact.id);
     }
   } catch (err) {
     logger.warn({ err: err.message, contactId: contact.id }, 'falha declinando card do desqualificado (segue)');
@@ -255,7 +257,7 @@ export async function closeLeadNoResponse(contact) {
       updated_at = CURRENT_TIMESTAMP
     WHERE id = ?
   `).run(contact.id);
-  await declineOppAndAppointment(contact);
+  await declineOppAndAppointment(contact, { lostReasonId: lostReasonSemResposta() });
   try {
     db.prepare(`INSERT INTO events_log (contact_id, kind, payload) VALUES (?, 'encerrado_sem_resposta', ?)`)
       .run(contact.id, JSON.stringify({ ghlContactId: contact.ghl_contact_id }));
@@ -275,7 +277,7 @@ export async function markDisqualified(contact, result) {
   `).run(result.qualification_score || 0, result.qualification_notes || '', contact.id);
 
   // Declina card + cancela reunião em paralelo (não bloqueia a resposta ao lead)
-  declineOppAndAppointment(contact).catch(() => {});
+  declineOppAndAppointment(contact, { lostReasonId: lostReasonDesqualificou() }).catch(() => {});
 
   // Log auditável do encerramento — alimenta o "Encerrados" do resumo diário
   // (pedido do Gabriel 25/08: saber quantos a Tina declinou no dia).

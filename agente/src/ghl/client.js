@@ -223,6 +223,11 @@ export const GHL = {
   async updateOpportunity(opportunityId, patch) {
     return ghl('PUT', `/opportunities/${opportunityId}`, patch);
   },
+  // Só status (+ motivo de perda): na doc v2 o lostReasonId existe neste endpoint e
+  // não no PUT /opportunities/:id.
+  async updateOpportunityStatus(opportunityId, { status, lostReasonId }) {
+    return ghl('PUT', `/opportunities/${opportunityId}/status`, { status, ...(lostReasonId ? { lostReasonId } : {}) });
+  },
   async getOpportunitiesByContact(contactId) {
     const q = new URLSearchParams({
       location_id: process.env.GHL_LOCATION_ID,

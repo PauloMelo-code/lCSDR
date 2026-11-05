@@ -16,10 +16,10 @@ import { db } from '../src/db/index.js';
 import { GHL } from '../src/ghl/client.js';
 import { upsertContactFromGHL, recordOutbound } from '../src/agent/contactService.js';
 import { sendText } from '../src/agent/messenger.js';
-import { claimToIaTina } from '../src/ghl/opportunities.js';
+import { claimToIaTina, resolvePipeline } from '../src/ghl/opportunities.js';
 
 const SEND = process.argv.includes('--send');
-const STAGE = process.env.ORGANICO_STAGE_ID || 'd596db34-ada4-4e7a-936a-943a9410d9a6'; // Funil Orgânico (Pré-Vendas LCA)
+const STAGE = resolvePipeline().stageOrganico; // Funil Orgânico: ORGANICO_STAGE_ID ou o padrão único de opportunities.js
 const DELAY_MS = Number(process.env.REENGAJAR_DELAY_MS || 4000);
 const REQUIRED_TAG = (process.env.GHL_TAG_REQUIRED ?? 'tina-liberada').toLowerCase();
 const WINDOW_MS = 24 * 3600 * 1000;
